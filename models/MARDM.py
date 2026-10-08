@@ -16,7 +16,7 @@ from utils.train_utils import lengths_to_mask, uniform, get_mask_subset_prob, co
 class MARDM(nn.Module):
     def __init__(self, ae_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
                  num_heads=4, dropout=0.2, clip_dim=512,
-                 diffmlps_batch_mul=4, diffmlps_model='SiT-XL', cond_drop_prob=0.1,
+                 diffmlps_batch_mul=4, diffmlps_model='DDPM-XL', cond_drop_prob=0.1,
                  clip_version='ViT-B/32', **kargs):
         super(MARDM, self).__init__()
 

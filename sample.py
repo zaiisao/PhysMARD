@@ -131,7 +131,7 @@ if __name__ == "__main__":
     parser.add_argument('--name', type=str, default='MARDM')
     parser.add_argument('--ae_name', type=str, default="AE")
     parser.add_argument('--ae_model', type=str, default='AE_Model')
-    parser.add_argument('--model', type=str, default='MARDM-SiT-XL')
+    parser.add_argument('--model', type=str, default='MARDM-DDPM-XL')
     parser.add_argument('--dataset_name', type=str, default='t2m')
     parser.add_argument('--dataset_dir', type=str, default='./datasets')
 

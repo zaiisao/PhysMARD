@@ -150,12 +150,16 @@ python utils/cal_mean_std.py
 ```
 </details>
 
+The default model for training, evaluation, sampling, and editing is `MARDM-DDPM-XL`.
+Use `--model MARDM-SiT-XL` to select SiT, and set `--name` to the matching checkpoint or experiment directory.
+The DDPM default uses noise-prediction MSE; switching the model does not enable ELBO training.
+
 ## 💻  Demo
 <details>
 
 ### (a) Generate with single textual instruction
 ```bash
-python sample.py --name MARDM_SiT_XL --text_prompt "A person is running on a treadmill."
+python sample.py --name MARDM_SiT_XL --model MARDM-SiT-XL --text_prompt "A person is running on a treadmill."
 ```
 ### (b) Generate from a prompt file
 in a txt file, in each line, your input should be `<text description>#<motion length>`,
@@ -163,7 +167,7 @@ you can push NA as motion length to let model determine the motion length
 (if there is **one** NA in file, all the others will be **NA** as well).
 
 ```bash
-python sample.py --name MARDM_SiT_XL --text_path ./text_prompt.txt
+python sample.py --name MARDM_SiT_XL --model MARDM-SiT-XL --text_path ./text_prompt.txt
 ```
 </details>
 
@@ -230,7 +234,7 @@ python evaluation_MARDM.py --name MARDM_DDPM_XL --model "MARDM-DDPM-XL" --datase
 <details>
 
 ```bash
-python edit.py --name MARDM_SiT_XL -msec 0.3,0.6 --text_prompt "A man dancing around." --source_motion 000612.npy
+python edit.py --name MARDM_SiT_XL --model MARDM-SiT-XL -msec 0.3,0.6 --text_prompt "A man dancing around." --source_motion 000612.npy
 ```
 </details>
 
