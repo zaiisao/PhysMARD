@@ -24,15 +24,24 @@ class DiffMLPs_DDPM(nn.Module):
         self.train_diffusion = create_diffusion(timestep_respacing="", noise_schedule="cosine", use_kl=use_kl)
         self.gen_diffusion = create_diffusion(timestep_respacing=num_sampling_steps, noise_schedule="cosine")
 
-    def forward(self, target, z, mask=None):
-        t = torch.randint(0, self.train_diffusion.num_timesteps, (target.shape[0],), device=target.device)
+    def forward(self, target, z, mask=None, t=None):
+        if t is None:
+            # Added by JA: allow for t to be passed in
+            t = torch.randint(
+                self.train_diffusion.num_timesteps,
+                (target.shape[0],),
+                device=target.device,
+            )
+
         model_kwargs = dict(c=z)
         loss_dict = self.train_diffusion.training_losses(self.net, target, t, model_kwargs)
         loss = loss_dict["loss"]
+
         if mask is not None:
             loss = (loss * mask).sum() / mask.sum()
-        # Added by JA: expose clean predictions and their diffusion timesteps.
-        return loss.mean(), loss_dict["pred_xstart"], t
+
+        # Added by JA: expose clean predictions alongside the data loss.
+        return loss.mean(), loss_dict["pred_xstart"]
 
     def sample(self, z, temperature=1.0, cfg=1.0):
         device = z.device

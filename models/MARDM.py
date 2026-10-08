@@ -178,11 +178,20 @@ class MARDM(nn.Module):
         target = target[mask]
         z = z[mask]
 
-        # Modified by JA: receive data loss, clean masked tokens, and diffusion timesteps.
-        data_loss, predicted_tokens, t = self.DiffMLPs(z=z, target=target)
-
         if physics:
             # Added by JA: use the first replica to reconstruct a complete sequence.
+            sequence_t = torch.randint(
+                self.DiffMLPs.train_diffusion.num_timesteps,
+                (b,), device=device,
+            )
+
+            token_t = sequence_t[:, None].expand(b, l)[sequence_mask]
+            token_t = token_t.repeat(self.diffmlps_batch_mul)
+
+            data_loss, predicted_tokens = self.DiffMLPs(
+                target=target, z=z, t=token_t,
+            )
+
             indices = sequence_mask.reshape(-1).nonzero(as_tuple=True)[0]
             predicted_sequence = clean_sequence.reshape(b * l, d).index_copy(
                 0,
@@ -194,15 +203,18 @@ class MARDM(nn.Module):
             predicted_latents = predicted_sequence.reshape(b, l, d).permute(0, 2, 1)
             predicted_motion = decoder(predicted_latents)
 
-            physics_nll = self.physics_likelihood(
+            physics_nll = self.physics_nll(
                 predicted_motion, reference_motion,
-                t[:indices.numel()],
+                sequence_t,
                 frame_lengths=m_lens * 4,
                 mean=mean,
                 std=std,
             )
 
             return data_loss + physics_nll
+        else:
+            data_loss, _ = self.DiffMLPs(z=z, target=target)
+
         return data_loss
 
     def forward_with_CFG(self, latents, cond_vector, padding_mask, cfg=3, mask=None, force_mask=False, hard_pseudo_reorder=False):
@@ -238,7 +250,7 @@ class MARDM(nn.Module):
         return scaled_logits
     
     # Added by JA: virtual-observation likelihood on predicted motion.
-    def physics_likelihood(
+    def physics_nll(
         self,
         predicted_motion,
         reference_motion,
