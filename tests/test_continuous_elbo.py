@@ -116,7 +116,8 @@ class ContinuousELBOTests(unittest.TestCase):
         for use_kl, expected in ((False, LossType.MSE), (True, LossType.RESCALED_KL)):
             wrapper = DiffMLPs_DDPM(8, 4, 1, 16, "4", use_kl=use_kl)
             self.assertEqual(wrapper.train_diffusion.loss_type, expected)
-            loss = wrapper(torch.randn(3, 8), torch.randn(3, 4))
+            # Modified by JA: unpack the loss and clean prediction.
+            loss, predicted_latents = wrapper(torch.randn(3, 8), torch.randn(3, 4))
             loss.backward()
             grads = [p.grad for p in wrapper.parameters() if p.grad is not None]
             self.assertTrue(grads and all(torch.isfinite(g).all() for g in grads))

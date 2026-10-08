@@ -166,14 +166,31 @@ class MARDM(nn.Module):
         input = torch.where(mask_mlatents.unsqueeze(-1), self.mask_latent.repeat(b, l, 1), input)
 
         z = self.forward(input, cond_vector, ~non_pad_mask, force_mask)
+        ##### Start of code added by JA
+        clean_sequence = target
+        sequence_mask = mask
+        selected_tokens = sequence_mask.sum()
+        ##### End of code added by JA
         target = target.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
         z = z.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
         mask = mask.reshape(b * l).repeat(self.diffmlps_batch_mul)
         target = target[mask]
         z = z[mask]
-        loss = self.DiffMLPs(z=z, target=target)
 
-        return loss
+        # Modified by JA: receive loss and predicted clean masked tokens.
+        loss, predicted_tokens = self.DiffMLPs(z=z, target=target)
+
+        # Added by JA: use the first replica to reconstruct a complete sequence.
+        indices = sequence_mask.reshape(-1).nonzero(as_tuple=True)[0]
+        predicted_sequence = clean_sequence.reshape(b * l, d).index_copy(
+            0,
+            indices,
+            predicted_tokens[:indices.numel()],
+        )
+
+        # Decoder expects [batch, latent_channels, sequence_length].
+        predicted_latents = predicted_sequence.reshape(b, l, d).permute(0, 2, 1)
+        return loss, predicted_latents, selected_tokens
 
     def forward_with_CFG(self, latents, cond_vector, padding_mask, cfg=3, mask=None, force_mask=False, hard_pseudo_reorder=False):
         if hard_pseudo_reorder:
@@ -206,6 +223,17 @@ class MARDM(nn.Module):
             scaled_logits = latents.reshape(b//2, l, self.ae_dim)
 
         return scaled_logits
+    
+    # Added by JA: virtual-observation likelihood on predicted motion.
+    def physics_likelihood(
+        self,
+        predicted_motion,
+        reference_motion,
+        frame_lengths,
+        mean,
+        std
+    ):
+        raise NotImplementedError("Physical residuals are not implemented yet.")
 
     @torch.no_grad()
     @eval_decorator

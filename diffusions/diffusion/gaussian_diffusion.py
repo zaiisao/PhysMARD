@@ -741,14 +741,17 @@ class GaussianDiffusion:
         terms = {}
 
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
-            terms["loss"] = self._vb_terms_bpd(
+            # Modified by JA: preserve both the loss and clean prediction
+            vb_terms = self._vb_terms_bpd(
                 model=model,
                 x_start=x_start,
                 x_t=x_t,
                 t=t,
                 clip_denoised=False,
                 model_kwargs=model_kwargs,
-            )["output"]
+            )
+            terms["loss"] = vb_terms["output"]
+            terms["pred_xstart"] = vb_terms["pred_xstart"]
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
@@ -784,6 +787,13 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
+            ##### Start of code added by JA
+            terms["pred_xstart"] = self._predict_xstart_from_eps(
+                x_t=x_t,
+                t=t,
+                eps=model_output,
+            )
+            ##### End of code added by JA
             terms["mse"] = mean_flat((target - model_output) ** 2)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]

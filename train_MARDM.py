@@ -16,6 +16,7 @@ from collections import OrderedDict, defaultdict
 from utils.train_utils import update_lr_warm_up, def_value, save, print_current_loss, update_ema
 from utils.eval_utils import evaluation_mardm
 import argparse
+import math
 
 
 def main(args):
@@ -107,6 +108,9 @@ def main(args):
     mardm.to(device)
     ema_mardm.to(device)
 
+    motion_mean = torch.as_tensor(mean, dtype=torch.float32, device=device)
+    motion_std = torch.as_tensor(std, dtype=torch.float32, device=device)
+
     optimizer = optim.AdamW(mardm.parameters(), betas=(0.9, 0.99), lr=args.lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.milestones, gamma=args.lr_decay)
 
@@ -158,8 +162,29 @@ def main(args):
             m_lens = m_lens // 4
 
             conds = conds.to(device).float() if torch.is_tensor(conds) else conds
+            
+            data_loss, predicted_latents, selected_tokens = mardm.forward_loss(latent, conds, m_lens)
 
-            loss = mardm.forward_loss(latent, conds, m_lens)
+            if args.physics:
+                # If block added by JA for supporting physics constraints functionality
+                predicted_motion = ae.decode(predicted_latents)
+
+                physics_nll = mardm.physics_likelihood(
+                    predicted_motion=predicted_motion,
+                    reference_motion=motion,
+                    frame_lengths=m_lens * 4,
+                    mean=motion_mean,
+                    std=motion_std,
+                )
+
+                physics_loss = physics_nll / (
+                    selected_tokens.clamp_min(1)
+                    * latent.shape[1]
+                    * math.log(2)
+                )
+                loss = data_loss + physics_loss
+            else:
+                loss = data_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -199,7 +224,7 @@ def main(args):
 
                 conds = conds.to(device).float() if torch.is_tensor(conds) else conds
 
-                loss = mardm.forward_loss(latent, conds, m_lens)
+                loss, _, _ = mardm.forward_loss(latent, conds, m_lens)
                 val_loss.append(loss.item())
 
         print(f"Validation loss:{np.mean(val_loss):.3f}")
@@ -250,6 +275,7 @@ if __name__ == "__main__":
 
     # Added by JA: omit this flag for MSE; include it for continuous-latent ELBO.
     parser.add_argument('--use_kl', action='store_true', help='Use the DDPM continuous-latent RESCALED_KL objective.')
+    parser.add_argument("--physics", action="store_true", help="Enable the predicted-clean physics likelihood.")
 
     arg = parser.parse_args()
     if arg.eval_every < 1:
