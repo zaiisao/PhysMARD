@@ -17,7 +17,7 @@ class MARDM(nn.Module):
     def __init__(self, ae_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
                  num_heads=4, dropout=0.2, clip_dim=512,
                  diffmlps_batch_mul=4, diffmlps_model='DDPM-XL', cond_drop_prob=0.1,
-                 clip_version='ViT-B/32', **kargs):
+                 clip_version='ViT-B/32', use_kl=False, **kargs):  # Added by JA: DDPM loss selection.
         super(MARDM, self).__init__()
 
         self.ae_dim = ae_dim
@@ -66,7 +66,13 @@ class MARDM(nn.Module):
         # --------------------------------------------------------------------------
         # DiffMLPs
         print('Loading DiffMLPs...')
-        self.DiffMLPs = DiffMLPs_models[diffmlps_model](target_channels=self.ae_dim, z_channels=self.latent_dim)
+        # Modified by JA: pass the loss option only to DDPM.
+        diffmlps_kwargs = dict(target_channels=self.ae_dim, z_channels=self.latent_dim)
+        if diffmlps_model == 'DDPM-XL':
+            diffmlps_kwargs['use_kl'] = use_kl
+        elif use_kl:
+            raise ValueError('use_kl is supported only for DDPM.')
+        self.DiffMLPs = DiffMLPs_models[diffmlps_model](**diffmlps_kwargs)
         self.diffmlps_batch_mul = diffmlps_batch_mul
 
     def __init_weights(self, module):

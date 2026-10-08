@@ -9,7 +9,7 @@ from diffusions.transport import create_transport, Sampler
 #                                     DiffMLPs                                  #
 #################################################################################
 class DiffMLPs_DDPM(nn.Module):
-    def __init__(self, target_channels, z_channels, depth, width, num_sampling_steps, learn_sigma=False):
+    def __init__(self, target_channels, z_channels, depth, width, num_sampling_steps, learn_sigma=False, use_kl=False):  # Added by JA: selectable DDPM objective.
         super(DiffMLPs_DDPM, self).__init__()
         self.in_channels = target_channels
         self.net = SimpleMLPAdaLN(
@@ -20,7 +20,8 @@ class DiffMLPs_DDPM(nn.Module):
             num_res_blocks=depth,
         )
 
-        self.train_diffusion = create_diffusion(timestep_respacing="", noise_schedule="cosine")
+        # Modified by JA: select continuous-latent ELBO or the original noise MSE.
+        self.train_diffusion = create_diffusion(timestep_respacing="", noise_schedule="cosine", use_kl=use_kl)
         self.gen_diffusion = create_diffusion(timestep_respacing=num_sampling_steps, noise_schedule="cosine")
 
     def forward(self, target, z, mask=None):

@@ -10,7 +10,8 @@ import numpy as np
 import torch as th
 import enum
 
-from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl
+# Modified by JA: continuous motion latents require a Gaussian density.
+from .diffusion_utils import continuous_gaussian_log_likelihood, normal_kl
 
 
 def mean_flat(tensor):
@@ -300,7 +301,8 @@ class GaussianDiffusion:
                     np.log(np.append(self.posterior_variance[1], self.betas[1:])),
                 ),
                 ModelVarType.FIXED_SMALL: (
-                    self.posterior_variance,
+                    # Modified by JA: match the positive endpoint likelihood variance.
+                    np.append(self.posterior_variance[1], self.posterior_variance[1:]),
                     self.posterior_log_variance_clipped,
                 ),
             }[self.model_var_type]
@@ -705,7 +707,9 @@ class GaussianDiffusion:
         )
         kl = mean_flat(kl) / np.log(2.0)
 
-        decoder_nll = -discretized_gaussian_log_likelihood(
+        # Modified by JA: replace the inherited image-bin likelihood with a continuous density.
+        # decoder_nll = -discretized_gaussian_log_likelihood(
+        decoder_nll = -continuous_gaussian_log_likelihood(
             x_start, means=out["mean"], log_scales=0.5 * out["log_variance"]
         )
         assert decoder_nll.shape == x_start.shape

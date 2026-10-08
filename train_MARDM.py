@@ -78,8 +78,12 @@ def main(args):
                             'latest.tar' if args.dataset_name == 't2m' else 'net_best_fid.tar'), map_location='cpu')
     model_key = 'ae'
     ae.load_state_dict(ckpt[model_key])
+    # Added by JA: keep the pretrained autoencoder fixed.
+    ae.requires_grad_(False)
+    ae.eval()
 
-    mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode='text')
+    # Modified by JA: select the DDPM objective from the command line.
+    mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode='text', use_kl=args.use_kl)
     ema_mardm = copy.deepcopy(mardm)
     ema_mardm.eval()
     for param in ema_mardm.parameters():
@@ -109,8 +113,9 @@ def main(args):
     epoch = 0
     it = 0
     if args.is_continue:
-        model_dir = pjoin(model_dir, 'latest.tar')
-        checkpoint = torch.load(model_dir, map_location=device)
+        # Modified by JA: preserve the directory used for subsequent checkpoint saves.
+        checkpoint_path = pjoin(model_dir, 'latest.tar')
+        checkpoint = torch.load(checkpoint_path, map_location=device)
         missing_keys, unexpected_keys = mardm.load_state_dict(checkpoint['mardm'], strict=False)
         missing_keys2, unexpected_keys2 = ema_mardm.load_state_dict(checkpoint['ema_mardm'], strict=False)
         assert len(unexpected_keys) == 0
@@ -119,7 +124,9 @@ def main(args):
         assert all([k.startswith('clip_model.') for k in missing_keys2])
         optimizer.load_state_dict(checkpoint['opt_mardm'])
         scheduler.load_state_dict(checkpoint['scheduler'])
-        epoch, it = checkpoint['ep'], checkpoint['total_it']
+        # Modified by JA: saved ep is the completed epoch's zero-based index.
+        epoch, it = checkpoint['ep'] + 1, checkpoint['total_it']
+        del checkpoint  # Added by JA: release loaded checkpoint tensors after restoring state.
         print("Load model epoch:%d iterations:%d" % (epoch, it))
 
     start_time = time.time()
@@ -145,7 +152,9 @@ def main(args):
             motion = motion.detach().float().to(device)
             m_lens = m_lens.detach().long().to(device)
 
-            latent = ae.encode(motion)
+            # Modified by JA: fixed latent targets need no encoder gradient graph.
+            with torch.no_grad():
+                latent = ae.encode(motion)
             m_lens = m_lens // 4
 
             conds = conds.to(device).float() if torch.is_tensor(conds) else conds
@@ -198,7 +207,8 @@ def main(args):
         if np.mean(val_loss) < worst_loss:
             print(f"Improved loss from {worst_loss:.02f} to {np.mean(val_loss)}!!!")
             worst_loss = np.mean(val_loss)
-        if args.need_evaluation:
+        # Modified by JA: full generation metrics only at the requested epoch interval.
+        if args.need_evaluation and epoch % args.eval_every == 0:
             best_fid, best_div, best_top1, best_top2, best_top3, best_matching, _, clip_score, writer, save_now= evaluation_mardm(
                 model_dir, eval_loader, ema_mardm, ae, logger, epoch-1, best_fid=best_fid, clip_score_old=clip_score,
                 best_div=best_div, best_top1=best_top1, best_top2=best_top2, best_top3=best_top3,
@@ -228,6 +238,8 @@ if __name__ == "__main__":
 
     parser.add_argument('--diffmlps_batch_mul', type=int, default=4)
     parser.add_argument('--need_evaluation', action="store_true" )
+    # Added by JA: keep per-epoch validation loss, reduce full generation evaluation.
+    parser.add_argument('--eval_every', type=int, default=20, help='Run full motion evaluation every N epochs.')
 
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -236,5 +248,10 @@ if __name__ == "__main__":
 
     parser.add_argument('--log_every', default=50, type=int)
 
+    # Added by JA: omit this flag for MSE; include it for continuous-latent ELBO.
+    parser.add_argument('--use_kl', action='store_true', help='Use the DDPM continuous-latent RESCALED_KL objective.')
+
     arg = parser.parse_args()
+    if arg.eval_every < 1:
+        parser.error('--eval_every must be positive')
     main(arg)

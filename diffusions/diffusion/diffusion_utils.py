@@ -5,6 +5,7 @@
 
 import torch as th
 import numpy as np
+import math  # Added by JA: continuous Gaussian normalization.
 
 
 def normal_kl(mean1, logvar1, mean2, logvar2):
@@ -71,3 +72,13 @@ def discretized_gaussian_log_likelihood(x, *, means, log_scales):
     )
     assert log_probs.shape == x.shape
     return log_probs
+
+# Added by JA: continuous latent density instead of image-bin probability.
+def continuous_gaussian_log_likelihood(x, *, means, log_scales):
+    """Return elementwise Gaussian log-density in nats; log_scales is log(std)."""
+    assert x.shape == means.shape == log_scales.shape
+    return -0.5 * (
+        (x - means).square() * th.exp(-2 * log_scales)
+        + 2 * log_scales
+        + math.log(2 * math.pi)
+    )
