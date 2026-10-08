@@ -708,7 +708,6 @@ class GaussianDiffusion:
         kl = mean_flat(kl) / np.log(2.0)
 
         # Modified by JA: replace the inherited image-bin likelihood with a continuous density.
-        # decoder_nll = -discretized_gaussian_log_likelihood(
         decoder_nll = -continuous_gaussian_log_likelihood(
             x_start, means=out["mean"], log_scales=0.5 * out["log_variance"]
         )

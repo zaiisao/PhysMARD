@@ -16,7 +16,6 @@ from collections import OrderedDict, defaultdict
 from utils.train_utils import update_lr_warm_up, def_value, save, print_current_loss, update_ema
 from utils.eval_utils import evaluation_mardm
 import argparse
-import math
 
 
 def main(args):
@@ -163,28 +162,14 @@ def main(args):
 
             conds = conds.to(device).float() if torch.is_tensor(conds) else conds
             
-            data_loss, predicted_latents, selected_tokens = mardm.forward_loss(latent, conds, m_lens)
-
-            if args.physics:
-                # If block added by JA for supporting physics constraints functionality
-                predicted_motion = ae.decode(predicted_latents)
-
-                physics_nll = mardm.physics_likelihood(
-                    predicted_motion=predicted_motion,
-                    reference_motion=motion,
-                    frame_lengths=m_lens * 4,
-                    mean=motion_mean,
-                    std=motion_std,
-                )
-
-                physics_loss = physics_nll / (
-                    selected_tokens.clamp_min(1)
-                    * latent.shape[1]
-                    * math.log(2)
-                )
-                loss = data_loss + physics_loss
-            else:
-                loss = data_loss
+            loss = mardm.forward_loss(
+                latent, conds, m_lens,
+                physics=args.physics,
+                decoder=ae.decode,
+                reference_motion=motion,
+                mean=motion_mean,
+                std=motion_std,
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -224,7 +209,7 @@ def main(args):
 
                 conds = conds.to(device).float() if torch.is_tensor(conds) else conds
 
-                loss, _, _ = mardm.forward_loss(latent, conds, m_lens)
+                loss = mardm.forward_loss(latent, conds, m_lens)
                 val_loss.append(loss.item())
 
         print(f"Validation loss:{np.mean(val_loss):.3f}")

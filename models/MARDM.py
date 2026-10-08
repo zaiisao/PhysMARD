@@ -130,7 +130,9 @@ class MARDM(nn.Module):
             x = torch.gather(x, dim=1, index=inverse_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)))
         return x
 
-    def forward_loss(self, latents, y, m_lens):
+    def forward_loss(self, latents, y, m_lens, *, physics=False, decoder=None,
+                     reference_motion=None, mean=None, std=None):
+        """Compute data loss and optionally physics loss."""
         latents = latents.permute(0, 2, 1)
         b, l, d = latents.shape
         device = latents.device
@@ -169,7 +171,6 @@ class MARDM(nn.Module):
         ##### Start of code added by JA
         clean_sequence = target
         sequence_mask = mask
-        selected_tokens = sequence_mask.sum()
         ##### End of code added by JA
         target = target.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
         z = z.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
@@ -177,20 +178,32 @@ class MARDM(nn.Module):
         target = target[mask]
         z = z[mask]
 
-        # Modified by JA: receive loss and predicted clean masked tokens.
-        loss, predicted_tokens = self.DiffMLPs(z=z, target=target)
+        # Modified by JA: receive data loss, clean masked tokens, and diffusion timesteps.
+        data_loss, predicted_tokens, t = self.DiffMLPs(z=z, target=target)
 
-        # Added by JA: use the first replica to reconstruct a complete sequence.
-        indices = sequence_mask.reshape(-1).nonzero(as_tuple=True)[0]
-        predicted_sequence = clean_sequence.reshape(b * l, d).index_copy(
-            0,
-            indices,
-            predicted_tokens[:indices.numel()],
-        )
+        if physics:
+            # Added by JA: use the first replica to reconstruct a complete sequence.
+            indices = sequence_mask.reshape(-1).nonzero(as_tuple=True)[0]
+            predicted_sequence = clean_sequence.reshape(b * l, d).index_copy(
+                0,
+                indices,
+                predicted_tokens[:indices.numel()],
+            )
 
-        # Decoder expects [batch, latent_channels, sequence_length].
-        predicted_latents = predicted_sequence.reshape(b, l, d).permute(0, 2, 1)
-        return loss, predicted_latents, selected_tokens
+            # Decoder expects [batch, latent_channels, sequence_length].
+            predicted_latents = predicted_sequence.reshape(b, l, d).permute(0, 2, 1)
+            predicted_motion = decoder(predicted_latents)
+
+            physics_nll = self.physics_likelihood(
+                predicted_motion, reference_motion,
+                t[:indices.numel()],
+                frame_lengths=m_lens * 4,
+                mean=mean,
+                std=std,
+            )
+
+            return data_loss + physics_nll
+        return data_loss
 
     def forward_with_CFG(self, latents, cond_vector, padding_mask, cfg=3, mask=None, force_mask=False, hard_pseudo_reorder=False):
         if hard_pseudo_reorder:
@@ -229,6 +242,7 @@ class MARDM(nn.Module):
         self,
         predicted_motion,
         reference_motion,
+        t,
         frame_lengths,
         mean,
         std

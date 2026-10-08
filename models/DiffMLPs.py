@@ -31,8 +31,8 @@ class DiffMLPs_DDPM(nn.Module):
         loss = loss_dict["loss"]
         if mask is not None:
             loss = (loss * mask).sum() / mask.sum()
-        # return loss.mean()
-        return loss.mean(), loss_dict["pred_xstart"]  # Added by JA: also return the clean prediction
+        # Added by JA: expose clean predictions and their diffusion timesteps.
+        return loss.mean(), loss_dict["pred_xstart"], t
 
     def sample(self, z, temperature=1.0, cfg=1.0):
         device = z.device
