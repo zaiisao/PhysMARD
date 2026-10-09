@@ -3,11 +3,12 @@ from os.path import join as pjoin
 import torch
 import numpy as np
 import random
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 from models.AE import AE_models
-from models.MARDM import MARDM_models
+from models.MARDM import MARDM, MARDM_models
+from models.PhysMARD import physmard_ddpm_xl
 from utils.evaluators import Evaluators
 from utils.datasets import Text2MotionDataset, collate_fn
 import time
@@ -15,8 +16,8 @@ import copy
 from collections import OrderedDict, defaultdict
 from utils.train_utils import update_lr_warm_up, def_value, save, print_current_loss, update_ema
 from utils.eval_utils import evaluation_mardm
+from utils.physics_calibration import calibrate_foot_height_error_seeded
 import argparse
-
 
 def main(args):
     #################################################################################
@@ -51,6 +52,26 @@ def main(args):
     val_dataset = Text2MotionDataset(mean, std, val_split_file, args.dataset_name, motion_dir, text_dir,
                                           args.unit_length, args.max_motion_length, 20, evaluation=False)
 
+    calibration_loader = None
+    if args.physics:
+        if args.dataset_name != "t2m":
+            raise ValueError("Foot calibration currently supports HumanML3D only.")
+
+        generator = torch.Generator().manual_seed(args.seed)
+        count = min(512, len(train_dataset))
+        indices = torch.randperm(
+            len(train_dataset), generator=generator
+        )[:count].tolist()
+
+        calibration_loader = DataLoader(
+            Subset(train_dataset, indices),
+            batch_size=16,
+            shuffle=False,
+            drop_last=False,
+            num_workers=args.num_workers,
+            generator=generator,
+        )
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, num_workers=args.num_workers,
                               shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=True, num_workers=args.num_workers,
@@ -82,8 +103,11 @@ def main(args):
     ae.requires_grad_(False)
     ae.eval()
 
-    # Modified by JA: select the DDPM objective from the command line.
-    mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode='text', use_kl=args.use_kl)
+    # Select physics-aware training only when requested.
+    model = physmard_ddpm_xl if args.physics else MARDM_models[args.model]
+    mardm = model(
+        ae_dim=ae.output_emb_width, cond_mode='text', use_kl=args.use_kl,
+    )
     ema_mardm = copy.deepcopy(mardm)
     ema_mardm.eval()
     for param in ema_mardm.parameters():
@@ -109,6 +133,14 @@ def main(args):
 
     motion_mean = torch.as_tensor(mean, dtype=torch.float32, device=device)
     motion_std = torch.as_tensor(std, dtype=torch.float32, device=device)
+
+    foot_height_bias = None
+    foot_height_sigma = None
+
+    if args.physics:
+        foot_height_bias, foot_height_sigma = calibrate_foot_height_error_seeded(
+            ae, calibration_loader, motion_mean, motion_std, seed=args.seed,
+        )
 
     optimizer = optim.AdamW(mardm.parameters(), betas=(0.9, 0.99), lr=args.lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.milestones, gamma=args.lr_decay)
@@ -162,14 +194,18 @@ def main(args):
 
             conds = conds.to(device).float() if torch.is_tensor(conds) else conds
             
-            loss = mardm.forward_loss(
-                latent, conds, m_lens,
-                physics=args.physics,
-                decoder=ae.decode,
-                reference_motion=motion,
-                mean=motion_mean,
-                std=motion_std,
-            )
+            if args.physics:
+                loss = mardm.forward_loss(
+                    latent, conds, m_lens,
+                    decoder=ae.decode,
+                    reference_motion=motion,
+                    mean=motion_mean,
+                    std=motion_std,
+                    foot_height_bias=foot_height_bias,
+                    foot_height_sigma=foot_height_sigma,
+                )
+            else:
+                loss = mardm.forward_loss(latent, conds, m_lens)
 
             optimizer.zero_grad()
             loss.backward()
@@ -209,7 +245,8 @@ def main(args):
 
                 conds = conds.to(device).float() if torch.is_tensor(conds) else conds
 
-                loss = mardm.forward_loss(latent, conds, m_lens)
+                # Validation reports the data objective without physical observations.
+                loss = MARDM.forward_loss(mardm, latent, conds, m_lens)
                 val_loss.append(loss.item())
 
         print(f"Validation loss:{np.mean(val_loss):.3f}")

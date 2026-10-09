@@ -130,9 +130,9 @@ class MARDM(nn.Module):
             x = torch.gather(x, dim=1, index=inverse_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)))
         return x
 
-    def forward_loss(self, latents, y, m_lens, *, physics=False, decoder=None,
-                     reference_motion=None, mean=None, std=None):
-        """Compute data loss and optionally physics loss."""
+    def forward_loss(self, latents, y, m_lens, *, shared_timesteps=False,
+                     return_details=False):
+        """Compute the base loss, optionally exposing tensors for subclass objectives."""
         latents = latents.permute(0, 2, 1)
         b, l, d = latents.shape
         device = latents.device
@@ -168,59 +168,34 @@ class MARDM(nn.Module):
         input = torch.where(mask_mlatents.unsqueeze(-1), self.mask_latent.repeat(b, l, 1), input)
 
         z = self.forward(input, cond_vector, ~non_pad_mask, force_mask)
-
-        ##### Start of code added by JA
         clean_sequence = target
         sequence_mask = mask
-
         num_selected = int(sequence_mask.sum().item())
         if num_selected == 0:
             raise ValueError("No valid masked tokens selected")
-        ##### End of code added by JA
 
         target = target.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
         z = z.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
         mask = mask.reshape(b * l).repeat(self.diffmlps_batch_mul)
         target = target[mask]
         z = z[mask]
-
-        if physics:
-            # Added by JA: use the first replica to reconstruct a complete sequence.
+        if shared_timesteps:
+            if not hasattr(self.DiffMLPs, "train_diffusion"):
+                raise ValueError("Shared diffusion timesteps require the DDPM branch")
+            # Each sequence shares one timestep across its tokens and replicas.
             sequence_t = torch.randint(
                 self.DiffMLPs.train_diffusion.num_timesteps,
                 (b,), device=device,
             )
-
             token_t = sequence_t[:, None].expand(b, l)[sequence_mask]
             token_t = token_t.repeat(self.diffmlps_batch_mul)
-
-            data_loss, predicted_tokens = self.DiffMLPs(
-                target=target, z=z, t=token_t,
-            )
-
-            indices = sequence_mask.reshape(-1).nonzero(as_tuple=True)[0]
-            predicted_sequence = clean_sequence.reshape(b * l, d).index_copy(
-                0,
-                indices,
-                predicted_tokens[:indices.numel()],
-            )
-
-            # Decoder expects [batch, latent_channels, sequence_length].
-            predicted_latents = predicted_sequence.reshape(b, l, d).permute(0, 2, 1)
-            predicted_motion = decoder(predicted_latents)
-
-            physics_nll = self.physics_nll(
-                predicted_motion, reference_motion,
-                sequence_t,
-                frame_lengths=m_lens * 4,
-                mean=mean,
-                std=std,
-            )
+            output = self.DiffMLPs(z=z, target=target, t=token_t)
         else:
-            data_loss, _ = self.DiffMLPs(z=z, target=target)
+            output = self.DiffMLPs(z=z, target=target)
 
-
-        if self.DiffMLPs.train_diffusion.loss_type.is_vb():
+        # DDPM returns clean predictions too; SiT returns only the scalar loss.
+        loss, predicted_tokens = output if isinstance(output, tuple) else (output, None)
+        if hasattr(self.DiffMLPs, "train_diffusion") and self.DiffMLPs.train_diffusion.loss_type.is_vb():
             # JA: Sum the KL/VLB contributions over each motion's selected
             # tokens and their coordinates, then average over the batch dimension.
             # Use natural-log units (nats), matching the summed physics NLL.
@@ -258,17 +233,23 @@ class MARDM(nn.Module):
             # target contains K identical copies of the selected clean tokens;
             # target[:num_selected] keeps one copy of each. Count the prior
             # once per token, without multiplying by K or T.
-            data_loss = data_loss * num_selected * d * math.log(2.0) / b
+            loss = loss * num_selected * d * math.log(2.0) / b
 
             prior_bpd = self.DiffMLPs.train_diffusion._prior_bpd(
                 target[:num_selected]
             )
-            data_loss += prior_bpd.sum() * d * math.log(2.0) / b
+            loss += prior_bpd.sum() * d * math.log(2.0) / b
 
-        if physics:
-            return data_loss + physics_nll
-
-        return data_loss
+        if return_details:
+            return {
+                "loss": loss,
+                "predicted_tokens": predicted_tokens,
+                "clean_sequence": clean_sequence,
+                "sequence_mask": sequence_mask,
+                "target": target,
+                "num_selected": num_selected,
+            }
+        return loss
 
     def forward_with_CFG(self, latents, cond_vector, padding_mask, cfg=3, mask=None, force_mask=False, hard_pseudo_reorder=False):
         if hard_pseudo_reorder:
@@ -302,18 +283,6 @@ class MARDM(nn.Module):
 
         return scaled_logits
     
-    # Added by JA: virtual-observation likelihood on predicted motion.
-    def physics_nll(
-        self,
-        predicted_motion,
-        reference_motion,
-        t,
-        frame_lengths,
-        mean,
-        std
-    ):
-        raise NotImplementedError("Physical residuals are not implemented yet.")
-
     @torch.no_grad()
     @eval_decorator
     def generate(self,
