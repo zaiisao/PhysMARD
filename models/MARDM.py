@@ -168,10 +168,16 @@ class MARDM(nn.Module):
         input = torch.where(mask_mlatents.unsqueeze(-1), self.mask_latent.repeat(b, l, 1), input)
 
         z = self.forward(input, cond_vector, ~non_pad_mask, force_mask)
+
         ##### Start of code added by JA
         clean_sequence = target
         sequence_mask = mask
+
+        num_selected = int(sequence_mask.sum().item())
+        if num_selected == 0:
+            raise ValueError("No valid masked tokens selected")
         ##### End of code added by JA
+
         target = target.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
         z = z.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
         mask = mask.reshape(b * l).repeat(self.diffmlps_batch_mul)
@@ -210,10 +216,57 @@ class MARDM(nn.Module):
                 mean=mean,
                 std=std,
             )
-
-            return data_loss + physics_nll
         else:
             data_loss, _ = self.DiffMLPs(z=z, target=target)
+
+
+        if self.DiffMLPs.train_diffusion.loss_type.is_vb():
+            # JA: Sum the KL/VLB contributions over each motion's selected
+            # tokens and their coordinates, then average over the batch dimension.
+            # Use natural-log units (nats), matching the summed physics NLL.
+            # This conversion is necessary for faithful ELBO accounting;
+            # the joint probabilistic model must also justify the combined loss.
+            #
+            # Only KL/VLB losses have this likelihood interpretation (is_vb).
+            #
+            # Let:
+            #   N = selected tokens across the batch, before replication
+            #   D = coordinates per latent token (512)
+            #   B = motion sequences in the batch
+            #   K = noisy training copies of each selected token (4)
+            #   T = diffusion timesteps (50)
+            #   a = sampled coordinate-wise KL or endpoint NLL, in nats
+            #
+            # The current scalar is:
+            #   L_original = T / (K * N * D * ln(2)) * sum_{tokens,copies,coords} a
+            #
+            # We want:
+            #   L_data = T / (K * B) * sum_{tokens,copies,coords} a
+            #          = L_original * N * D * ln(2) / B
+            #
+            # This sums coordinates and tokens within each sequence, while
+            # averaging the K noisy copies and the B sequences. T is already
+            # included, so do not multiply by T again.
+            #
+            # Complete the bound with the terminal prior:
+            #   L_prior = D * ln(2) / B * sum_{selected tokens} prior_bpd
+            #   L_complete = L_data + L_prior
+            #
+            # The prior measures KL(q(z_T | z_0) || N(0, I)) at the final
+            # diffusion step. Its value is computed directly from the clean
+            # target and the noise schedule, without sampling noise or time.
+            # target contains K identical copies of the selected clean tokens;
+            # target[:num_selected] keeps one copy of each. Count the prior
+            # once per token, without multiplying by K or T.
+            data_loss = data_loss * num_selected * d * math.log(2.0) / b
+
+            prior_bpd = self.DiffMLPs.train_diffusion._prior_bpd(
+                target[:num_selected]
+            )
+            data_loss += prior_bpd.sum() * d * math.log(2.0) / b
+
+        if physics:
+            return data_loss + physics_nll
 
         return data_loss
 
