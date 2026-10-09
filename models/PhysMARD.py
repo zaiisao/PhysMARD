@@ -129,7 +129,8 @@ class PhysMARD(MARDM):
         foot_y = torch.where(
             valid, foot_y, torch.full_like(foot_y, foot_height_bias),
         )
-        standardized_height = (foot_y - foot_height_bias) / foot_height_sigma
+        # Float64 avoids log-CDF gradient cancellation for extreme early predictions.
+        standardized_height = (foot_y.double() - foot_height_bias) / foot_height_sigma
         point_nll = -torch.special.log_ndtr(standardized_height)
         sequence_nll = torch.where(valid, point_nll, torch.zeros_like(point_nll)).sum((1, 2))
         return sequence_nll.mean()

@@ -66,6 +66,18 @@ class PhysicsMetricsTests(unittest.TestCase):
         self.assertTrue(np.array_equal(np.random.get_state()[1], numpy_state[1]))
         self.assertTrue(torch.equal(torch.get_rng_state(), torch_state))
 
+    def test_extreme_penetration_has_finite_correct_gradient(self):
+        model = PhysMARD.__new__(PhysMARD)
+        joints = torch.zeros(1, 1, 22, 3, requires_grad=True)
+        with torch.no_grad():
+            joints[..., [7, 10, 8, 11], 1] = -100.
+        loss = model.ground_penetration_nll(joints, torch.ones(1, 1, dtype=torch.bool), 0., .001)
+        loss.backward()
+        gradient = joints.grad[..., [7, 10, 8, 11], 1]
+        self.assertTrue(torch.isfinite(gradient).all())
+        # In the far negative tail, d(-log Phi(h/sigma))/dh ~= h/sigma^2.
+        torch.testing.assert_close(gradient, torch.full_like(gradient, -1e8), rtol=1e-4, atol=0.)
+
     def test_metrics_preserve_loss_and_gradient(self):
         model = PhysMARD.__new__(PhysMARD)
         motion = torch.zeros(1, 3, 67, requires_grad=True)
