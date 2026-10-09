@@ -4,6 +4,7 @@ import torch
 
 from models.MARDM import MARDM
 from utils.motion_process import recover_from_ric
+from utils.physics_metrics import get_physics_metrics
 
 
 class PhysMARD(MARDM):
@@ -12,7 +13,7 @@ class PhysMARD(MARDM):
     def forward_loss(self, latents, y, m_lens, *, decoder=None,
                      reference_motion=None, mean=None, std=None,
                      foot_height_bias=None, foot_height_sigma=None):
-        """Compute the diffusion loss plus the physical observation likelihood."""
+        """Return the combined training loss and detached logging metrics."""
         result = super().forward_loss(
             latents, y, m_lens,
             shared_timesteps=True, return_details=True,
@@ -34,7 +35,7 @@ class PhysMARD(MARDM):
         predicted_latents = predicted_sequence.reshape(b, l, d).permute(0, 2, 1)
         predicted_motion = decoder(predicted_latents)
 
-        physics_nll = self.physics_nll(
+        physics_nll, physics_metrics = self.physics_nll(
             predicted_motion, reference_motion,
             frame_lengths=m_lens * 4,
             mean=mean,
@@ -42,7 +43,11 @@ class PhysMARD(MARDM):
             foot_height_bias=foot_height_bias,
             foot_height_sigma=foot_height_sigma,
         )
-        return data_loss + physics_nll
+
+        loss = data_loss + physics_nll
+        physics_metrics.update(data_loss=data_loss.detach(), physics_nll=physics_nll.detach())
+
+        return loss, physics_metrics
 
     # Added by JA: virtual-observation likelihood on predicted motion.
     def physics_nll(
@@ -105,14 +110,15 @@ class PhysMARD(MARDM):
         # ELBO contribution: E_q[log p(O_energy | x)]; disabled for now.
         mechanical_energy_consistency_nll = 0.0
 
-        total_physics_nll = (
+        physics_nll = (
             ground_penetration_nll
             + contact_consistency_nll
             + balance_nll
             + mechanical_energy_consistency_nll
         )
+        physics_metrics = get_physics_metrics(joints, valid_frames)
 
-        return total_physics_nll
+        return physics_nll, physics_metrics
 
     def ground_penetration_nll(self, joints, valid_frames, foot_height_bias, foot_height_sigma):
         """Sum calibrated foot-ground NLLs, then average over the batch."""

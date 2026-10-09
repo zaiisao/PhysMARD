@@ -1,4 +1,5 @@
 import os
+import json
 from os.path import join as pjoin
 import torch
 import numpy as np
@@ -17,6 +18,7 @@ from collections import OrderedDict, defaultdict
 from utils.train_utils import update_lr_warm_up, def_value, save, print_current_loss, update_ema
 from utils.eval_utils import evaluation_mardm
 from utils.physics_calibration import calibrate_foot_height_error_seeded
+from utils.physics_metrics import make_generation_panel, evaluate_generation_penetration
 import argparse
 
 def main(args):
@@ -164,12 +166,49 @@ def main(args):
         del checkpoint  # Added by JA: release loaded checkpoint tensors after restoring state.
         print("Load model epoch:%d iterations:%d" % (epoch, it))
 
+    penetration_panel = None
+    if args.dataset_name == "t2m":
+        panel_path = pjoin(model_dir, 'penetration_panel.json')
+        if args.is_continue and os.path.exists(panel_path):
+            with open(panel_path) as handle:
+                penetration_panel = json.load(handle)
+        else:
+            penetration_panel = make_generation_panel(val_dataset, args.seed)
+            with open(panel_path, 'w') as handle:
+                json.dump(penetration_panel, handle, indent=2)
+
+    def log_generated_penetration(current_epoch):
+        if penetration_panel is None:
+            return
+
+        metrics = evaluate_generation_penetration(
+            ema_mardm, ae, penetration_panel, motion_mean, motion_std, args.seed,
+        )
+
+        for tag, value in metrics.items():
+            logger.add_scalar('Generated/' + tag, value, current_epoch)
+
+        print('Generated feet (Y < -0.001 rate): ' + ', '.join(
+            f'{key}={value:.6g}' for key, value in metrics.items()
+        ))
+
+        with open(pjoin(model_dir, 'penetration_metrics.jsonl'), 'a') as handle:
+            json.dump(dict(epoch=current_epoch, seed=args.seed, samples=len(penetration_panel),
+                           mar_steps=18, cfg=4.5, temperature=1.0, **metrics), handle)
+            handle.write('\n')
+
+        logger.flush()
+
+    # Record the starting checkpoint so subsequent changes have a reference.
+    log_generated_penetration(epoch)
+
     start_time = time.time()
     total_iters = args.epoch * len(train_loader)
     print(f'Total Epochs: {args.epoch}, Total Iters: {total_iters}')
     print('Iters Per Epoch, Training: %04d, Validation: %03d' % (len(train_loader), len(val_loader)))
 
     logs = defaultdict(def_value, OrderedDict())
+    logged_batches = 0
 
     best_fid, best_div, best_top1, best_top2, best_top3, best_matching, clip_score = 1000, 0, 0, 0, 0, 100, -1
     worst_loss = 100
@@ -195,7 +234,7 @@ def main(args):
             conds = conds.to(device).float() if torch.is_tensor(conds) else conds
             
             if args.physics:
-                loss = mardm.forward_loss(
+                loss, training_metrics = mardm.forward_loss(
                     latent, conds, m_lens,
                     decoder=ae.decode,
                     reference_motion=motion,
@@ -206,12 +245,20 @@ def main(args):
                 )
             else:
                 loss = mardm.forward_loss(latent, conds, m_lens)
+                training_metrics = {"data_loss": loss.detach()}
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             scheduler.step()
 
+            logged_batches += 1
+            for tag, value in training_metrics.items():
+                value = value.item()
+                if tag == 'foot_pen_max':
+                    logs[tag] = max(logs[tag], value)
+                else:
+                    logs[tag] += value
             logs['loss'] += loss.item()
             logs['lr'] += optimizer.param_groups[0]['lr']
             update_ema(mardm, ema_mardm, 0.9999)
@@ -219,9 +266,11 @@ def main(args):
             if it % args.log_every == 0:
                 mean_loss = OrderedDict()
                 for tag, value in logs.items():
-                    logger.add_scalar('Train/%s' % tag, value / args.log_every, it)
-                    mean_loss[tag] = value / args.log_every
+                    average = value if tag == 'foot_pen_max' else value / logged_batches
+                    logger.add_scalar('Train/%s' % tag, average, it)
+                    mean_loss[tag] = average
                 logs = defaultdict(def_value, OrderedDict())
+                logged_batches = 0
                 print_current_loss(start_time, it, total_iters, mean_loss, epoch=epoch, inner_iter=i)
 
         save(pjoin(model_dir, 'latest.tar'), epoch, mardm, optimizer, scheduler,
@@ -254,6 +303,10 @@ def main(args):
         if np.mean(val_loss) < worst_loss:
             print(f"Improved loss from {worst_loss:.02f} to {np.mean(val_loss)}!!!")
             worst_loss = np.mean(val_loss)
+
+        if epoch % args.eval_every == 0:
+            log_generated_penetration(epoch)
+
         # Modified by JA: full generation metrics only at the requested epoch interval.
         if args.need_evaluation and epoch % args.eval_every == 0:
             best_fid, best_div, best_top1, best_top2, best_top3, best_matching, _, clip_score, writer, save_now= evaluation_mardm(
