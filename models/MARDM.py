@@ -179,6 +179,7 @@ class MARDM(nn.Module):
         mask = mask.reshape(b * l).repeat(self.diffmlps_batch_mul)
         target = target[mask]
         z = z[mask]
+        sequence_t = None
         if shared_timesteps:
             if not hasattr(self.DiffMLPs, "train_diffusion"):
                 raise ValueError("Shared diffusion timesteps require the DDPM branch")
@@ -248,6 +249,7 @@ class MARDM(nn.Module):
                 "sequence_mask": sequence_mask,
                 "target": target,
                 "num_selected": num_selected,
+                "sequence_t": sequence_t,
             }
         return loss
 

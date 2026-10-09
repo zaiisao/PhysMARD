@@ -19,6 +19,7 @@ class PhysMARD(MARDM):
             shared_timesteps=True, return_details=True,
         )
         data_loss = result["loss"]
+        sequence_t = result["sequence_t"]
         clean_sequence = result["clean_sequence"]
         sequence_mask = result["sequence_mask"]
         b, l, d = clean_sequence.shape
@@ -42,6 +43,7 @@ class PhysMARD(MARDM):
             std=std,
             foot_height_bias=foot_height_bias,
             foot_height_sigma=foot_height_sigma,
+            sequence_t=sequence_t,
         )
 
         loss = data_loss + physics_nll
@@ -59,6 +61,7 @@ class PhysMARD(MARDM):
         std,
         foot_height_bias=None,
         foot_height_sigma=None,
+        sequence_t=None,
     ):
         """Prepare physical motion once and sum the constraint likelihoods."""
         # reference_motion is reserved for future contact supervision.
@@ -92,7 +95,7 @@ class PhysMARD(MARDM):
         # L_ground = -mean_batch(sum_valid_frames_and_feet(log p)).
         # ELBO contribution: E_q[log p(O_ground | x)]; here evaluated at x_hat.
         ground_penetration_nll = self.ground_penetration_nll(
-            joints, valid_frames, foot_height_bias, foot_height_sigma,
+            joints, valid_frames, foot_height_bias, foot_height_sigma, sequence_t,
         )
 
         # Contact likelihood p(O_contact | x_hat): formulation pending.
@@ -120,7 +123,9 @@ class PhysMARD(MARDM):
 
         return physics_nll, physics_metrics
 
-    def ground_penetration_nll(self, joints, valid_frames, foot_height_bias, foot_height_sigma):
+    def ground_penetration_nll(
+        self, joints, valid_frames, foot_height_bias, foot_height_sigma, sequence_t,
+    ):
         """Sum calibrated foot-ground NLLs, then average over the batch."""
         foot_y = joints[..., [7, 10, 8, 11], 1]
         valid = valid_frames[..., None]
@@ -129,8 +134,19 @@ class PhysMARD(MARDM):
         foot_y = torch.where(
             valid, foot_y, torch.full_like(foot_y, foot_height_bias),
         )
+        alpha_bar = torch.as_tensor(
+            self.DiffMLPs.train_diffusion.alphas_cumprod,
+            device=joints.device,
+            dtype=torch.float64,
+        )[sequence_t.to(device=joints.device, dtype=torch.long)]
+        sigma_phys_t = (
+            torch.as_tensor(foot_height_sigma, device=joints.device, dtype=torch.float64)
+            / alpha_bar.sqrt()
+        )
         # Float64 avoids log-CDF gradient cancellation for extreme early predictions.
-        standardized_height = (foot_y.double() - foot_height_bias) / foot_height_sigma
+        standardized_height = (
+            foot_y.double() - foot_height_bias
+        ) / sigma_phys_t[:, None, None]
         point_nll = -torch.special.log_ndtr(standardized_height)
         sequence_nll = torch.where(valid, point_nll, torch.zeros_like(point_nll)).sum((1, 2))
         return sequence_nll.mean()
