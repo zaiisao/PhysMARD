@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 import math
+import numpy as np
 from diffusions.diffusion import create_diffusion
 from diffusions.transport import create_transport, Sampler
+from models.pidm_ddim import ddim_sample_x0
 
 #################################################################################
 #                                     DiffMLPs                                  #
@@ -34,14 +36,49 @@ class DiffMLPs_DDPM(nn.Module):
             )
 
         model_kwargs = dict(c=z)
-        loss_dict = self.train_diffusion.training_losses(self.net, target, t, model_kwargs)
+        # Added by JA: draw the forward-process noise here (training_losses would
+        # draw the same tensor first), so the exact noisy input can be exposed.
+        noise = torch.randn_like(target)
+        loss_dict = self.train_diffusion.training_losses(
+            self.net, target, t, model_kwargs, noise=noise,
+        )
         loss = loss_dict["loss"]
 
         if mask is not None:
             loss = (loss * mask).sum() / mask.sum()
 
-        # Added by JA: expose clean predictions alongside the data loss.
-        return loss.mean(), loss_dict["pred_xstart"]
+        # Added by JA: expose clean predictions and the noisy input alongside the data loss.
+        noisy_target = self.train_diffusion.q_sample(target, t, noise=noise)
+        return loss.mean(), loss_dict["pred_xstart"], noisy_target
+
+    # Added by JA: PIDM sample estimation through the reference ddim_sample_x0.
+    def ddim_x0(self, x_t, t, z, reduced_steps=0):
+        """Return PIDM's deterministic DDIM estimate of x_0 from x_t.
+
+        reduced_steps=0 maps x_t -> x_1 -> x_0, as proposed in the PIDM manuscript.
+        The conditioning z is held fixed for every denoiser call.
+        """
+        diffusion = self.train_diffusion
+        net = diffusion._wrap_model(self.net)
+        to_tensor = lambda values: torch.as_tensor(values, device=x_t.device).float()
+        alphas = 1.0 - diffusion.betas
+        # PIDM's diff_dict keys, built from the training schedule in float64.
+        diff_dict = {
+            'alphas': to_tensor(alphas),
+            'alphas_prod': to_tensor(diffusion.alphas_cumprod),
+            'sqrt_recip_alphas_cumprod': to_tensor(diffusion.sqrt_recip_alphas_cumprod),
+            'sqrt_recipm1_alphas_cumprod': to_tensor(diffusion.sqrt_recipm1_alphas_cumprod),
+            'posterior_mean_coef1': to_tensor(diffusion.posterior_mean_coef1),
+            'posterior_mean_coef2': to_tensor(diffusion.posterior_mean_coef2),
+            'sqrt_recip_alphas': to_tensor(np.sqrt(1.0 / alphas)),
+            'noise_mean_coeff': to_tensor(
+                np.sqrt(1.0 / alphas) * (1.0 - alphas) / np.sqrt(1.0 - diffusion.alphas_cumprod)
+            ),
+        }
+        return ddim_sample_x0(
+            x_t, t, lambda x, s: net(x, s, c=z), x_t.shape,
+            reduced_steps, 0., diff_dict, model_pred_mode='eps',
+        )
 
     def sample(self, z, temperature=1.0, cfg=1.0):
         device = z.device

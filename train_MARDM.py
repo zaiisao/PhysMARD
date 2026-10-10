@@ -107,9 +107,13 @@ def main(args):
 
     # Select physics-aware training only when requested.
     model = physmard_ddpm_xl if args.physics else MARDM_models[args.model]
+    physics_kwargs = dict(physics_ddim_steps=args.physics_ddim_steps) if args.physics else {}
     mardm = model(
         ae_dim=ae.output_emb_width, cond_mode='text', use_kl=args.use_kl,
+        **physics_kwargs,
     )
+    if args.physics:
+        print(f'Physics clean estimate: DDIM, reduced steps: {args.physics_ddim_steps}')
     ema_mardm = copy.deepcopy(mardm)
     ema_mardm.eval()
     for param in ema_mardm.parameters():
@@ -351,8 +355,12 @@ if __name__ == "__main__":
     # Added by JA: omit this flag for MSE; include it for continuous-latent ELBO.
     parser.add_argument('--use_kl', action='store_true', help='Use the DDPM continuous-latent RESCALED_KL objective.')
     parser.add_argument("--physics", action="store_true", help="Enable the predicted-clean physics likelihood.")
+    parser.add_argument("--physics_ddim_steps", type=int, default=0,
+                        help="Intermediate DDIM jumps for the physics clean estimate; 0 maps x_t -> x_1 -> x_0.")
 
     arg = parser.parse_args()
     if arg.eval_every < 1:
         parser.error('--eval_every must be positive')
+    if arg.physics_ddim_steps < 0:
+        parser.error('--physics_ddim_steps must be non-negative')
     main(arg)

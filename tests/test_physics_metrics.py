@@ -1,6 +1,7 @@
 """Penetration diagnostic masking, repeatability, and gradient isolation."""
 
 import random
+import types
 import unittest
 
 import numpy as np
@@ -37,6 +38,16 @@ class FakeAE(torch.nn.Module):
         return latent
 
 
+def make_physics_model():
+    """PhysMARD stub whose one-step schedule has alpha_bar = 1, so sigma_phys(t) = sigma."""
+    model = PhysMARD.__new__(PhysMARD)
+    torch.nn.Module.__init__(model)
+    model.DiffMLPs = types.SimpleNamespace(
+        train_diffusion=types.SimpleNamespace(alphas_cumprod=np.ones(1)),
+    )
+    return model
+
+
 class PhysicsMetricsTests(unittest.TestCase):
     def test_masking_and_detachment(self):
         joints = torch.zeros(1, 3, 22, 3, requires_grad=True)
@@ -67,11 +78,13 @@ class PhysicsMetricsTests(unittest.TestCase):
         self.assertTrue(torch.equal(torch.get_rng_state(), torch_state))
 
     def test_extreme_penetration_has_finite_correct_gradient(self):
-        model = PhysMARD.__new__(PhysMARD)
+        model = make_physics_model()
         joints = torch.zeros(1, 1, 22, 3, requires_grad=True)
         with torch.no_grad():
             joints[..., [7, 10, 8, 11], 1] = -100.
-        loss = model.ground_penetration_nll(joints, torch.ones(1, 1, dtype=torch.bool), 0., .001)
+        loss = model.ground_penetration_nll(
+            joints, torch.ones(1, 1, dtype=torch.bool), 0., .001, torch.tensor([0]),
+        )
         loss.backward()
         gradient = joints.grad[..., [7, 10, 8, 11], 1]
         self.assertTrue(torch.isfinite(gradient).all())
@@ -79,15 +92,16 @@ class PhysicsMetricsTests(unittest.TestCase):
         torch.testing.assert_close(gradient, torch.full_like(gradient, -1e8), rtol=1e-4, atol=0.)
 
     def test_metrics_preserve_loss_and_gradient(self):
-        model = PhysMARD.__new__(PhysMARD)
+        model = make_physics_model()
         motion = torch.zeros(1, 3, 67, requires_grad=True)
         kwargs = dict(reference_motion=None, frame_lengths=torch.tensor([2]),
                       mean=torch.zeros(67), std=torch.ones(67),
-                      foot_height_bias=0., foot_height_sigma=.01)
+                      foot_height_bias=0., foot_height_sigma=.01,
+                      sequence_t=torch.tensor([0]))
         from utils.motion_process import recover_from_ric
         joints = recover_from_ric(motion, 22)
         plain = model.ground_penetration_nll(
-            joints, torch.tensor([[True, True, False]]), 0., .01,
+            joints, torch.tensor([[True, True, False]]), 0., .01, torch.tensor([0]),
         )
         logged, metrics = model.physics_nll(motion, **kwargs)
         torch.testing.assert_close(plain, logged)

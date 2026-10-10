@@ -180,6 +180,7 @@ class MARDM(nn.Module):
         target = target[mask]
         z = z[mask]
         sequence_t = None
+        token_t = None
         if shared_timesteps:
             if not hasattr(self.DiffMLPs, "train_diffusion"):
                 raise ValueError("Shared diffusion timesteps require the DDPM branch")
@@ -194,8 +195,8 @@ class MARDM(nn.Module):
         else:
             output = self.DiffMLPs(z=z, target=target)
 
-        # DDPM returns clean predictions too; SiT returns only the scalar loss.
-        loss, predicted_tokens = output if isinstance(output, tuple) else (output, None)
+        # DDPM returns clean predictions and noisy inputs too; SiT returns only the scalar loss.
+        loss, predicted_tokens, noisy_tokens = output if isinstance(output, tuple) else (output, None, None)
         if hasattr(self.DiffMLPs, "train_diffusion") and self.DiffMLPs.train_diffusion.loss_type.is_vb():
             # JA: Sum the KL/VLB contributions over each motion's selected
             # tokens and their coordinates, then average over the batch dimension.
@@ -250,6 +251,9 @@ class MARDM(nn.Module):
                 "target": target,
                 "num_selected": num_selected,
                 "sequence_t": sequence_t,
+                "noisy_tokens": noisy_tokens,
+                "token_cond": z,
+                "token_t": token_t,
             }
         return loss
 

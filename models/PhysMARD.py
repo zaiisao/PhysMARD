@@ -10,6 +10,11 @@ from utils.physics_metrics import get_physics_metrics
 class PhysMARD(MARDM):
     """Reuse MARDM architecture and inference; extend its training objective."""
 
+    def __init__(self, *args, physics_ddim_steps=0, **kwargs):
+        super().__init__(*args, **kwargs)
+        # PIDM sample estimation: intermediate DDIM jumps before the final x_1 -> x_0 call.
+        self.physics_ddim_steps = physics_ddim_steps
+
     def forward_loss(self, latents, y, m_lens, *, decoder=None,
                      reference_motion=None, mean=None, std=None,
                      foot_height_bias=None, foot_height_sigma=None):
@@ -26,10 +31,19 @@ class PhysMARD(MARDM):
 
         predicted_tokens = result["predicted_tokens"]
         indices = sequence_mask.reshape(-1).nonzero(as_tuple=True)[0]
+        num_selected = indices.numel()
+        # PIDM sample estimation on the first replica, whose rows follow the order of indices.
+        # The data loss above keeps the original x_t and t; only the physics input changes.
+        physics_tokens = self.DiffMLPs.ddim_x0(
+            result["noisy_tokens"][:num_selected],
+            result["token_t"][:num_selected],
+            result["token_cond"][:num_selected],
+            reduced_steps=self.physics_ddim_steps,
+        )
         predicted_sequence = clean_sequence.reshape(b * l, d).index_copy(
             0,
             indices,
-            predicted_tokens[:indices.numel()],
+            physics_tokens,
         )
 
         # Decoder expects [batch, latent_channels, sequence_length].
@@ -48,6 +62,9 @@ class PhysMARD(MARDM):
 
         loss = data_loss + physics_nll
         physics_metrics.update(data_loss=data_loss.detach(), physics_nll=physics_nll.detach())
+        physics_metrics.update(ddim_x0_shift=(
+            physics_tokens - predicted_tokens[:num_selected]
+        ).detach().norm(dim=-1).mean())
 
         return loss, physics_metrics
 
