@@ -1,10 +1,9 @@
 # Frozen structured foot-contact VAE source copy
 
-This directory contains a read-through copy of the frozen VAE used by the visual-contact diagnostics. It is not wired into `PhysMARD` or the MARDM training path.
+This directory contains a partial source copy of the structured foot-contact VAE for reference. The experiment-specific `RealVAE` wrapper is not included. Nothing here is wired into `PhysMARD` or the MARDM training path.
 
 ## Files
 
-- `source/vae_real.py` — real-motion VAE encoder configuration.
 - `source/model.py` — structured geometry and seven-state foot-contact model.
 - `source/geometry.py` and `source/support_geometry.json` — support-point geometry and the cached SMPL prior.
 
