@@ -5,9 +5,15 @@ from torch import nn
 from torch.nn import functional as F
 from torch.distributions import MultivariateNormal, Normal, kl_divergence
 
-from geometry import load_support_geometry
+from .geometry import load_support_geometry
 
 FPS = 20.0
+ENCODER_FEATURES = (
+    "ankle_height", "toe_height", "foot_pitch", "ankle_speed", "toe_speed",
+)
+NUM_ENCODER_FEATURES = len(ENCODER_FEATURES)
+GEOMETRY_DIM = 6
+GEOMETRY_POSTERIOR_OUTPUT_SIZE = GEOMETRY_DIM + GEOMETRY_DIM * (GEOMETRY_DIM + 1) // 2
 
 class SupportPoint(IntEnum):
     HEEL = 0
@@ -42,24 +48,24 @@ SUPPORT_POINT_BY_STATE = {
     FootState.TOE_TIP_STICKING: SupportPoint.TOE_TIP,
     FootState.TOE_TIP_SLIDING: SupportPoint.TOE_TIP,
 }
-STICKING_SLIDING_GROUPS = (
-    (FootState.FLAT_STICKING, FootState.FLAT_SLIDING),
-    (FootState.FOREFOOT_STICKING, FootState.FOREFOOT_SLIDING),
-    (FootState.TOE_TIP_STICKING, FootState.TOE_TIP_SLIDING),
-)
+
+FLAT_STATES = (FootState.FLAT_STICKING, FootState.FLAT_SLIDING)
+FOREFOOT_STATES = (FootState.FOREFOOT_STICKING, FootState.FOREFOOT_SLIDING)
+TOE_TIP_STATES = (FootState.TOE_TIP_STICKING, FootState.TOE_TIP_SLIDING)
+
+STICKING_SLIDING_GROUPS = (FLAT_STATES, FOREFOOT_STATES, TOE_TIP_STATES)
+
 STATE_ORDER = tuple(FootState)
 
 def step_model_codes():
-    """[7, 7]: how the support point's horizontal step is scored for a transition state i -> state j."""
-    codes = torch.full(
-        (NUM_STATES, NUM_STATES), int(StepModel.FREE), dtype=torch.long
-    )
+    """Return each state's motion model for every previous-to-current transition."""
+    codes = [[StepModel.FREE for _ in STATE_ORDER] for _ in STATE_ORDER]
     for sticking, sliding in STICKING_SLIDING_GROUPS:
-        codes[sticking, sticking] = StepModel.STICK
-        codes[sticking, sliding] = StepModel.SLIDE
-        codes[sliding, sticking] = StepModel.SLIDE
-        codes[sliding, sliding] = StepModel.SLIDE
-    return codes
+        codes[sticking][sticking] = StepModel.STICK
+        codes[sticking][sliding] = StepModel.SLIDE
+        codes[sliding][sticking] = StepModel.SLIDE
+        codes[sliding][sliding] = StepModel.SLIDE
+    return tuple(tuple(row) for row in codes)
 
 
 def foot_frame(ankle, toe):
@@ -90,10 +96,8 @@ def flat_pitch(geom):
     """
     g = geom.view(-1, 3, 2)
 
-    heel_normal = g[:, SupportPoint.HEEL, 1]
-    pad_normal = g[:, SupportPoint.PAD, 1]
-    heel_along = g[:, SupportPoint.HEEL, 0]
-    pad_along = g[:, SupportPoint.PAD, 0]
+    heel_normal, pad_normal = g[:, SupportPoint.HEEL, 1], g[:, SupportPoint.PAD, 1]
+    heel_along, pad_along = g[:, SupportPoint.HEEL, 0], g[:, SupportPoint.PAD, 0]
 
     normal_difference = heel_normal - pad_normal
     along_difference = heel_along - pad_along
@@ -131,6 +135,7 @@ def chain_log_partition(init, frame, edge, lengths):
     return torch.logsumexp(final_alpha, dim=-1)
 
 
+# Scores support height and pitch per frame, and support-point speed between frames.
 class FootContactEmission(nn.Module):
     """Gaussian observation factors for support height, pitch, and horizontal motion."""
 
@@ -148,36 +153,29 @@ class FootContactEmission(nn.Module):
         self.raw_slide_speed_sd = nn.Parameter(torch.zeros(()))
         self.raw_free_speed_sd = nn.Parameter(torch.zeros(()))
 
-        state_support_points = torch.tensor([
-            int(SUPPORT_POINT_BY_STATE[state]) for state in STATE_ORDER
-        ])
-        state_step_codes = step_model_codes()
-        contact_state_mask = torch.tensor([
-            state != FootState.AIRBORNE for state in STATE_ORDER
-        ])
-        flat_state_mask = torch.tensor([
-            state in (FootState.FLAT_STICKING, FootState.FLAT_SLIDING)
-            for state in STATE_ORDER
-        ])
-        fixed_floor_height = torch.tensor(float(floor_height))
+        self.floor_height = float(floor_height)
 
-        self.register_buffer("support_point", state_support_points)
-        self.register_buffer("step_codes", state_step_codes)
-        self.register_buffer("is_contact", contact_state_mask)
-        self.register_buffer("is_flat", flat_state_mask)
-        self.register_buffer("floor_height", fixed_floor_height)
+        self.support_point = tuple(SUPPORT_POINT_BY_STATE.values())
+        self.is_contact = tuple(state != FootState.AIRBORNE for state in STATE_ORDER)
+        self.is_flat = tuple(state in FLAT_STATES for state in STATE_ORDER)
+        self.step_codes = step_model_codes()
 
     def forward(self, ankle, toe, geom, lengths):
         frames = ankle.shape[1]
+        support_point = torch.tensor(self.support_point, device=ankle.device)
+        step_codes = torch.tensor(self.step_codes, device=ankle.device)
+        is_contact = torch.tensor(self.is_contact, device=ankle.device)
+        is_flat = torch.tensor(self.is_flat, device=ankle.device)
+
         points = support_point_positions(ankle, toe, geom)
         _, _, _, pitch = foot_frame(ankle, toe)
 
-        support_height = points[..., 1][..., self.support_point]
-        floor = self.floor_height.to(device=ankle.device, dtype=ankle.dtype).view(1, 1, 1)
+        support_height = points[..., 1][..., support_point]
+        floor = ankle.new_tensor(self.floor_height).view(1, 1, 1)
         contact_height = Normal(loc=floor, scale=F.softplus(self.raw_contact_sd))
         airborne_height = Normal(loc=floor + self.air_mean, scale=F.softplus(self.raw_air_sd))
         height_score = torch.where(
-            self.is_contact,
+            is_contact,
             contact_height.log_prob(support_height),
             airborne_height.log_prob(support_height),
         )
@@ -190,25 +188,33 @@ class FootContactEmission(nn.Module):
             loc=self.pitch_mean,
             scale=F.softplus(self.raw_pitch_sd),
         )
+
         pitch_score = torch.where(
-            self.is_flat,
+            is_flat,
             flat_pitch_dist.log_prob(pitch),
             other_pitch_dist.log_prob(pitch),
         )
         frame_score = height_score + pitch_score
 
-        horizontal_step = FPS * (points[:, 1:] - points[:, :-1])[..., (0, 2)]
-        speed_sds = (
+        support_displacement = points[:, 1:] - points[:, :-1]
+        x_displacement = support_displacement[..., 0]
+        z_displacement = support_displacement[..., 2]
+        horizontal_displacement = torch.stack((x_displacement, z_displacement), dim=-1)
+        horizontal_velocity = FPS * horizontal_displacement
+
+        speed_scales = (
             F.softplus(self.raw_free_speed_sd),
             F.softplus(self.raw_stick_speed_sd),
             F.softplus(self.raw_slide_speed_sd),
         )
+
         step_scores = torch.stack([
-            Normal(loc=0.0, scale=sd).log_prob(horizontal_step).sum(-1)
-            for sd in speed_sds
+            Normal(0.0, scale).log_prob(horizontal_velocity).sum(-1)
+            for scale in speed_scales
         ], dim=-1)
-        destination_points = self.support_point[None, :].expand(NUM_STATES, -1)
-        transition_score = step_scores[:, :, destination_points, self.step_codes]
+
+        destination_points = support_point[None, :].expand(NUM_STATES, -1)
+        transition_score = step_scores[:, :, destination_points, step_codes]
 
         valid_frames = (
             torch.arange(frames, device=ankle.device)[None] < lengths[:, None]
@@ -216,34 +222,40 @@ class FootContactEmission(nn.Module):
         valid_steps = (
             torch.arange(frames - 1, device=ankle.device)[None] < (lengths - 1)[:, None]
         )[..., None, None]
+
         return frame_score * valid_frames, transition_score * valid_steps
 
-
+# Predicts a Gaussian over foot support geometry from ankle/toe height, pitch, and speed.
 class GeometryPosterior(nn.Module):
-    """Encoder and full-covariance q(g|x,u,side), parameterized relative to the geometry prior."""
+    """Encoder and full-covariance q(g|x,side), parameterized relative to the geometry prior."""
 
-    def __init__(self, context_dim, hidden):
+    def __init__(self, hidden):
         super().__init__()
+
         self.encoder = nn.Sequential(
-            nn.Conv1d(5 + context_dim, hidden, 5, padding=2), nn.GELU(),
+            nn.Conv1d(NUM_ENCODER_FEATURES, hidden, 5, padding=2), nn.GELU(),
             nn.Conv1d(hidden, hidden, 5, padding=2), nn.GELU(),
         )
-        self.cont_head = nn.Linear(hidden, 27)
+        self.cont_head = nn.Linear(hidden, GEOMETRY_POSTERIOR_OUTPUT_SIZE)
+
         nn.init.zeros_(self.cont_head.weight)
         nn.init.zeros_(self.cont_head.bias)
 
     def forward(self, inputs, lengths):
-        valid = torch.arange(inputs.shape[1], device=inputs.device)[None] < lengths[:, None]
+        frame_ids = torch.arange(inputs.shape[1], device=inputs.device)
+        valid = frame_ids.unsqueeze(0) < lengths.unsqueeze(1)
+
         features = self.encoder(inputs.transpose(1, 2)).transpose(1, 2)
         pooled = (features * valid[..., None]).sum(1) / lengths[:, None]
+
         return self.cont_head(pooled)
 
     def sample_and_kl(self, raw, prior_mean, prior_covariance, sample):
-        eta_mean, tri_raw = raw[:, :6], raw[:, 6:]
-        tri_idx = torch.tril_indices(6, 6, device=raw.device)
+        eta_mean, tri_raw = raw[:, :GEOMETRY_DIM], raw[:, GEOMETRY_DIM:]
+        tri_idx = torch.tril_indices(GEOMETRY_DIM, GEOMETRY_DIM, device=raw.device)
         diagonal = tri_idx[0] == tri_idx[1]
         tri_values = torch.where(diagonal[None], tri_raw.exp(), tri_raw)
-        eta_chol = raw.new_zeros((raw.shape[0], 6, 6))
+        eta_chol = raw.new_zeros((raw.shape[0], GEOMETRY_DIM, GEOMETRY_DIM))
         eta_chol[:, tri_idx[0], tri_idx[1]] = tri_values
 
         prior_chol = torch.linalg.cholesky(prior_covariance)
@@ -252,91 +264,98 @@ class GeometryPosterior(nn.Module):
 
         posterior = MultivariateNormal(posterior_mean, scale_tril=posterior_chol)
         geom = posterior.rsample() if sample else posterior_mean
+
         standard_posterior = MultivariateNormal(eta_mean, scale_tril=eta_chol)
         standard_prior = MultivariateNormal(
             torch.zeros_like(eta_mean),
             torch.eye(eta_mean.shape[-1], device=eta_mean.device, dtype=eta_mean.dtype),
         )
         kl = kl_divergence(standard_posterior, standard_prior)
+
         return geom, kl
 
 
 class StructuredFootVAE(nn.Module):
-    """Full-covariance fixed-floor candidate. Learned: observation scales, state prior and q(g|x,u)."""
+    """HumanML3D structured foot-contact VAE with normalized geometry encoder inputs."""
 
-    def __init__(self, context_dim, geometry=None, hidden=64,
-                 init_air_mean=0.10, init_pitch_mean=-0.3, fixed_floor_height=0.0):
+    def __init__(self, input_mean, input_sd, floor_height=-0.0109, hidden=64,
+                 init_air_mean=0.10, init_pitch_mean=-0.3):
         super().__init__()
 
-        self.prior_init = nn.Linear(context_dim, NUM_STATES)
-        self.prior_edge = nn.Sequential(nn.Linear(2 * context_dim, hidden), nn.Tanh(), nn.Linear(hidden, NUM_STATES ** 2))
-        for layer in (self.prior_init, self.prior_edge[-1]):
-            nn.init.zeros_(layer.weight)
-            nn.init.zeros_(layer.bias)
+        if len(input_mean) != NUM_ENCODER_FEATURES or len(input_sd) != NUM_ENCODER_FEATURES:
+            raise ValueError(f"Expected {NUM_ENCODER_FEATURES} encoder statistics: {', '.join(ENCODER_FEATURES)}")
 
-        self.geometry_posterior_network = GeometryPosterior(context_dim, hidden)
-        self.emission = FootContactEmission(
-            init_air_mean, init_pitch_mean, fixed_floor_height
-        )
+        # Learned initial and transition probabilities over the seven contact states.
+        self.prior_init_logits = nn.Parameter(torch.zeros(NUM_STATES))
+        self.prior_transition_logits = nn.Parameter(torch.zeros(NUM_STATES, NUM_STATES))
 
-        geometry = geometry or load_support_geometry()
-        sides = ('left', 'right')
-        geometry_mean = torch.tensor([geometry[side]['mean'] for side in sides])
-        geometry_covariance = torch.tensor([
-            geometry[side]['covariance'] for side in sides
-        ])
+        self.geometry_posterior = GeometryPosterior(hidden)
+        self.foot_contact_emission = FootContactEmission(init_air_mean, init_pitch_mean, floor_height)
+
+        geometry = load_support_geometry()
+        geometry_mean = torch.tensor([geometry["left"]["mean"], geometry["right"]["mean"]])
+        geometry_covariance = torch.tensor([geometry["left"]["covariance"], geometry["right"]["covariance"]])
+
+        input_mean = torch.as_tensor(input_mean, dtype=torch.float32)
+        input_sd = torch.as_tensor(input_sd, dtype=torch.float32)
+
         self.register_buffer("geometry_mean", geometry_mean)
         self.register_buffer("geometry_cov", geometry_covariance)
+        self.register_buffer("encoder_input_mean", input_mean)
+        self.register_buffer("encoder_input_sd", input_sd)
 
-    def state_prior_log_potentials(self, u, lengths):
-        """Context-conditioned initial and transition log-probabilities [B,K], [B,T-1,K,K]."""
-        b, t, _ = u.shape
-        valid = torch.arange(t, device=u.device)[None] < lengths[:, None]
-        init_context = (u * valid[..., None]).sum(1) / lengths[:, None]
-        p_init = F.log_softmax(self.prior_init(init_context), -1)
-        pairs = torch.cat([u[:, :-1], u[:, 1:]], -1)
-        p_edge = F.log_softmax(self.prior_edge(pairs).reshape(b, t - 1, NUM_STATES, NUM_STATES), -1)
-        p_edge = p_edge * (torch.arange(t - 1, device=u.device)[None] < (lengths - 1)[:, None])[..., None, None]
+    def state_prior_log_potentials(self, lengths, frames):
+        """Return initial-state and transition log-probabilities for each sequence."""
+        batch = len(lengths)
+        p_init = F.log_softmax(self.prior_init_logits, -1).expand(batch, -1)
+        edge = F.log_softmax(self.prior_transition_logits, -1)
+        p_edge = edge.expand(batch, frames - 1, NUM_STATES, NUM_STATES)
         return p_init, p_edge
 
-    def encoder_inputs(self, u, ankle, toe):
-        """Per-frame encoder inputs [B,T,5+context]: ankle height, toe height, pitch, ankle speed, toe speed, u."""
+    def encoder_inputs(self, ankle, toe):
+        """Five per-frame foot features: ankle/toe height, pitch, and ankle/toe speed."""
         _, _, _, pitch = foot_frame(ankle, toe)
 
         def speed(p):
             v = FPS * torch.linalg.vector_norm(p[:, 1:] - p[:, :-1], dim=-1, keepdim=True)
             return torch.cat([v, v[:, -1:]], 1)
 
-        return torch.cat([ankle[..., 1:2], toe[..., 1:2], pitch, speed(ankle), speed(toe), u], -1)
+        ankle_height, toe_height = ankle[..., 1:2], toe[..., 1:2]
+        ankle_speed, toe_speed = speed(ankle), speed(toe)
 
-    def encode(self, u, ankle, toe, lengths):
-        """Raw q(g | x) parameters [B,27]: per-frame conv features averaged over valid frames."""
-        return self.geometry_posterior_network(
-            self.encoder_inputs(u, ankle, toe), lengths
-        )
+        return ankle_height, toe_height, pitch, ankle_speed, toe_speed
 
-    def sample_geometry(self, u, ankle, toe, lengths, foot_sides, sample):
-        """Draw q(g|x,u,side) and compute its KL to the side-specific prior."""
-        raw = self.encode(u, ankle, toe, lengths)
+    def encode(self, ankle, toe, lengths):
+        """Return geometry-posterior parameters pooled over valid frames."""
+        features = torch.cat(self.encoder_inputs(ankle, toe), dim=-1)
+        features = (features - self.encoder_input_mean) / self.encoder_input_sd
+        return self.geometry_posterior(features, lengths)
+
+    def sample_geometry(self, ankle, toe, lengths, foot_sides, sample):
+        """Draw q(g|x,side) and compute its KL to the side-specific prior."""
+        raw = self.encode(ankle, toe, lengths)
+
         prior_mean = self.geometry_mean[foot_sides]
         prior_covariance = self.geometry_cov[foot_sides]
-        return self.geometry_posterior_network.sample_and_kl(
+
+        return self.geometry_posterior.sample_and_kl(
             raw, prior_mean, prior_covariance, sample
         )
 
-    def forward(self, u, ankle, toe, lengths, foot_sides, sample=True):
+    def forward(self, ankle, toe, lengths, foot_sides, sample=True):
         """Return the per-sequence ELBO used for training."""
         geom, kl_g = self.sample_geometry(
-            u, ankle, toe, lengths, foot_sides, sample
+            ankle, toe, lengths, foot_sides, sample
         )
-        p_init, p_edge = self.state_prior_log_potentials(u, lengths)
+        p_init, p_edge = self.state_prior_log_potentials(lengths, ankle.shape[1])
 
-        frame, emission_edge = self.emission(ankle, toe, geom, lengths)
+        frame, emission_edge = self.foot_contact_emission(ankle, toe, geom, lengths)
         transition_log_potentials = p_edge + emission_edge
 
         log_lik = chain_log_partition(
             p_init, frame, transition_log_potentials, lengths
         )
+        # ELBO = expected HMM log score under q(g|x) minus KL(q(g|x) || p(g)).
         elbo = log_lik - kl_g
 
         return elbo

@@ -1,0 +1,52 @@
+{
+  "dataset_root": "/disk4/jaehoon/HumanML3D",
+  "device": "cuda:2",
+  "seed": 731,
+  "floor_m": -0.0109,
+  "split_seeds": {
+    "train": 1,
+    "validation": 2,
+    "test": 3
+  },
+  "split_sizes_clips": {
+    "train": 1000,
+    "validation": 30,
+    "test": 50
+  },
+  "model": {
+    "hidden": 64,
+    "states": [
+      "airborne",
+      "flat_sticking",
+      "flat_sliding",
+      "forefoot_sticking",
+      "forefoot_sliding",
+      "toe_tip_sticking",
+      "toe_tip_sliding"
+    ]
+  },
+  "initial_observation_parameters": {
+    "contact_sd_m": 0.01,
+    "air_mean_m": 0.1,
+    "air_sd_m": 0.08,
+    "flat_pitch_sd_rad": 0.05,
+    "pitch_mean_rad": -0.3,
+    "pitch_sd_rad": 0.5,
+    "stick_speed_sd_mps": 0.03,
+    "slide_speed_sd_mps": 0.5,
+    "free_speed_sd_mps": 1.0
+  },
+  "scale_schedule": {
+    "fixed_scales_epochs": 100,
+    "scale_finetune_epochs": 100
+  },
+  "training": {
+    "batch_sequences": 16,
+    "geometry_samples": 8,
+    "validation_geometry_samples": 8,
+    "input_statistics_rows": 400,
+    "learning_rate": 0.001,
+    "gradient_clip_norm": 10.0,
+    "optimizer": "Adam"
+  }
+}

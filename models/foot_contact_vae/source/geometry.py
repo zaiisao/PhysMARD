@@ -9,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-SMPL_MODEL_DIR = '/disk3/jaehoon/KineGuard-archive/external/WHAM/dataset/body_models'
 GEOMETRY_CACHE = Path(__file__).resolve().parent / 'support_geometry.json'
 FOOT_JOINTS = dict(left=(7, 10), right=(8, 11))   # (ankle, toe) in SMPL / HumanML3D numbering
 POINTS = ('heel', 'pad', 'tip')
@@ -42,7 +41,7 @@ def _points_in_foot_frame(vertices, joints, weights, ankle, toe):
                 length_m=float(length))
 
 
-def derive_support_geometry(model_dir=SMPL_MODEL_DIR, num_shapes=1000, seed=0, cache=GEOMETRY_CACHE):
+def derive_support_geometry(model_dir, num_shapes=1000, seed=0, cache=GEOMETRY_CACHE):
     """Per foot side: SMPL-neutral points, and mean / covariance of the 6 coordinates over random body shapes.
 
     Shapes are betas ~ N(0, I) for the 10-coefficient neutral SMPL model in its rest pose.
@@ -73,6 +72,10 @@ def derive_support_geometry(model_dir=SMPL_MODEL_DIR, num_shapes=1000, seed=0, c
 
 
 def load_support_geometry(cache=GEOMETRY_CACHE):
-    if not Path(cache).exists():
-        return derive_support_geometry(cache=cache)
-    return json.loads(Path(cache).read_text())['geometry']
+    cache = Path(cache)
+    if not cache.exists():
+        raise FileNotFoundError(
+            f"Support geometry cache not found: {cache}. "
+            "Generate it with derive_support_geometry(model_dir=...) and a local SMPL model directory."
+        )
+    return json.loads(cache.read_text())['geometry']

@@ -1,0 +1,29 @@
+{
+  "name": "HumanML3D structured foot-contact VAE",
+  "checkpoint": "humanml3d_best.pt",
+  "checkpoint_sha256": "0a6b22e659561d07f07b567411ed4d7c8f5b5838a79bec23df3928c7e4ced16f",
+  "source_commit": "b87b2bdf6af961ac8eec5ed476af36d4842dc161",
+  "best_validation_elbo": 953.0832824707031,
+  "floor_height_m": -0.0109,
+  "fps": 20,
+  "hidden": 64,
+  "input_shape": "[T,22,3] world-space HumanML3D joints in meters",
+  "input_statistics_source": "checkpoint buffers encoder_input_mean and encoder_input_sd",
+  "side_order": [
+    "left",
+    "right"
+  ],
+  "state_order": [
+    "airborne",
+    "flat_sticking",
+    "flat_sliding",
+    "forefoot_sticking",
+    "forefoot_sliding",
+    "toe_tip_sticking",
+    "toe_tip_sliding"
+  ],
+  "training_manifest": "../training/trained_checkpoint_manifest.json",
+  "note": "This is the checkpoint used by analysis/joint_contact_physics. Older incompatible local run files are archived under analysis/joint_contact_physics/legacy_vae_runs/.",
+  "source_checkpoint_sha256": "0665bd3b676d34336d91ed237661c7da9cbe570a087a80e9051c2294034b2ebb",
+  "checkpoint_conversion": "Prepared once from the original checkpoint: removed zero context channels and folded zero-input prior layers into static logits. Fixed state lookup tables were removed from the state dict. The fixed floor value was removed from the state dict."
+}

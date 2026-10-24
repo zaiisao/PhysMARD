@@ -125,4 +125,5 @@ dmypy.json
 /datasets/
 /glove/
 /analysis
-/models/foot_contact_vae/source/runs_real/
+/models/foot_contact_vae/runs/
+/models/foot_contact_vae/checkpoints/*.pt
