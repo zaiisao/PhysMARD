@@ -124,10 +124,5 @@ dmypy.json
 /checkpoints
 /datasets/
 /glove/
-/analysis/
+/analysis
 /models/foot_contact_vae/source/runs_real/
-
-# Keep the new incremental physical-state study versioned.
-!/analysis/
-/analysis/*
-!/analysis/latent_foot_incremental/
