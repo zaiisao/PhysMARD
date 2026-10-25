@@ -14,16 +14,7 @@
     "test": 50
   },
   "model": {
-    "hidden": 64,
-    "states": [
-      "airborne",
-      "flat_sticking",
-      "flat_sliding",
-      "forefoot_sticking",
-      "forefoot_sliding",
-      "toe_tip_sticking",
-      "toe_tip_sliding"
-    ]
+    "hidden": 64
   },
   "initial_observation_parameters": {
     "contact_sd_m": 0.01,

@@ -10,7 +10,8 @@ import numpy as np
 import torch
 
 GEOMETRY_CACHE = Path(__file__).resolve().parent / 'support_geometry.json'
-FOOT_JOINTS = dict(left=(7, 10), right=(8, 11))   # (ankle, toe) in SMPL / HumanML3D numbering
+FOOT_JOINTS = {"left": (7, 10), "right": (8, 11)}
+SIDE_NAMES = tuple(FOOT_JOINTS)
 POINTS = ('heel', 'pad', 'tip')
 
 # ----------------------------------------------------------------------------------------

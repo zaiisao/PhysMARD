@@ -1,5 +1,4 @@
 """Load the trained HumanML3D VAE and infer foot-contact probabilities from joints."""
-from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -7,119 +6,74 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .source.model import GEOMETRY_DIM, StructuredFootVAE
-from .source.model import chain_log_partition
+from .source.geometry import FOOT_JOINTS, SIDE_NAMES
+from .source.model import GEOMETRY_DIM, STATE_ORDER, StructuredFootVAE, chain_marginals
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 DEFAULT_CHECKPOINT = PACKAGE_ROOT / "checkpoints" / "humanml3d_best.pt"
 DEFAULT_CONFIG = PACKAGE_ROOT / "training" / "config.json"
-STATE_NAMES = (
-    "airborne", "flat_sticking", "flat_sliding", "forefoot_sticking",
-    "forefoot_sliding", "toe_tip_sticking", "toe_tip_sliding",
-)
-
-
-def geometry_posterior(model, batch):
-    """Return q(g)'s mean, Cholesky factor, covariance, and analytic KL per foot."""
-    raw = model.encode(batch["ankle"], batch["toe"], batch["lengths"])
-    eta_mean, tri_raw = raw[:, :GEOMETRY_DIM], raw[:, GEOMETRY_DIM:]
-    tri = torch.tril_indices(GEOMETRY_DIM, GEOMETRY_DIM, device=raw.device)
-    diagonal = tri[0] == tri[1]
-    eta_chol = raw.new_zeros((raw.shape[0], GEOMETRY_DIM, GEOMETRY_DIM))
-    eta_chol[:, tri[0], tri[1]] = torch.where(diagonal[None], tri_raw.exp(), tri_raw)
-    prior_mean = model.geometry_mean[batch["sides"]]
-    prior_chol = torch.linalg.cholesky(model.geometry_cov[batch["sides"]])
-    q_mean = prior_mean + torch.einsum("bij,bj->bi", prior_chol, eta_mean)
-    q_chol = prior_chol @ eta_chol
-    q_cov = q_chol @ q_chol.transpose(-1, -2)
-    eta_cov = eta_chol @ eta_chol.transpose(-1, -2)
-    kl = 0.5 * (
-        eta_mean.square().sum(-1)
-        + torch.diagonal(eta_cov, dim1=-2, dim2=-1).sum(-1)
-        - GEOMETRY_DIM
-        - 2 * torch.log(torch.diagonal(eta_chol, dim1=-2, dim2=-1)).sum(-1)
-    )
-    return q_mean, q_chol, q_cov, kl
+STATE_NAMES = tuple(state.name.lower() for state in STATE_ORDER)
 
 
 def make_batch(joints, device):
     """Convert [T,22,3] world-space HumanML3D joints to the two-foot VAE batch."""
-    tensor = torch.as_tensor(joints, dtype=torch.float32, device=device)
-    frames = tensor.shape[0]
+    joints_tensor = torch.as_tensor(joints, dtype=torch.float32, device=device)
+    frames = joints_tensor.shape[0]
+
+    left_ankle_index, left_toe_index = FOOT_JOINTS["left"]
+    right_ankle_index, right_toe_index = FOOT_JOINTS["right"]
+
+    left_ankle = joints_tensor[:, left_ankle_index]
+    right_ankle = joints_tensor[:, right_ankle_index]
+    left_toe = joints_tensor[:, left_toe_index]
+    right_toe = joints_tensor[:, right_toe_index]
+
+    ankles = torch.stack((left_ankle, right_ankle))
+    toes = torch.stack((left_toe, right_toe))
+    lengths = torch.full((len(SIDE_NAMES),), frames, dtype=torch.long, device=device)
+    sides = torch.arange(len(SIDE_NAMES), dtype=torch.long, device=device)
+
     return {
-        "ankle": torch.stack((tensor[:, 7], tensor[:, 8])),
-        "toe": torch.stack((tensor[:, 10], tensor[:, 11])),
-        "lengths": torch.full((2,), frames, dtype=torch.long, device=device),
-        "sides": torch.tensor((0, 1), dtype=torch.long, device=device),
+        "ankle": ankles,
+        "toe": toes,
+        "lengths": lengths,
+        "sides": sides,
     }
 
 
-def _repeat(value, samples):
-    return value.unsqueeze(0).expand(samples, *value.shape).reshape(samples * value.shape[0], *value.shape[1:])
+def _repeat_for_samples(value, sample_count):
+    """Stack each batch item once per sample, keeping sample-major order."""
+    expanded = value.unsqueeze(0).expand(sample_count, *value.shape)
+    batch_size = value.shape[0]
+    return expanded.reshape(sample_count * batch_size, *value.shape[1:])
 
 
-def elbo_mc(model, batch, geometry_samples, eps=None):
-    """Monte Carlo ELBO with analytic KL for a batch of foot sequences."""
-    q_mean, q_chol, _, kl = geometry_posterior(model, batch)
-    if eps is None:
-        eps = torch.randn((geometry_samples, *q_mean.shape), device=q_mean.device, dtype=q_mean.dtype)
-    geometry = q_mean[None] + torch.einsum("bij,sbj->sbi", q_chol, eps)
-    repeated = {
-        key: _repeat(batch[key], geometry_samples)
-        for key in ("ankle", "toe", "lengths", "sides")
-    }
-    p_init, p_edge = model.state_prior_log_potentials(repeated["lengths"], repeated["ankle"].shape[1])
-    frame, emission_edge = model.foot_contact_emission(
-        repeated["ankle"], repeated["toe"], geometry.reshape(-1, GEOMETRY_DIM), repeated["lengths"]
-    )
-    log_z = chain_log_partition(p_init, frame, p_edge + emission_edge, repeated["lengths"])
-    log_z = log_z.reshape(geometry_samples, q_mean.shape[0])
-    elbo = log_z.mean(0) - kl
-    return elbo, {"log_z_samples": log_z, "kl_geometry": kl, "q_geometry_mean": q_mean,
-                  "q_geometry_cholesky": q_chol}
-
-
-def _forward_backward(model, batch, geometry):
-    """Exact HMM marginals for each sampled foot geometry."""
-    batch_size, frames = batch["ankle"].shape[:2]
-    lengths = batch["lengths"]
-    p_init, p_edge = model.state_prior_log_potentials(lengths, frames)
-    frame, emission_edge = model.foot_contact_emission(batch["ankle"], batch["toe"], geometry, lengths)
-    edge = p_edge + emission_edge
-
-    alpha = [p_init + frame[:, 0]]
-    for t in range(1, frames):
-        alpha.append(torch.logsumexp(alpha[-1][:, :, None] + edge[:, t - 1], dim=1) + frame[:, t])
-    alpha = torch.stack(alpha, dim=1)
-
-    beta = [None] * frames
-    beta[-1] = torch.zeros_like(alpha[:, -1])
-    for t in range(frames - 2, -1, -1):
-        beta[t] = torch.logsumexp(
-            edge[:, t] + frame[:, t + 1, None, :] + beta[t + 1][:, None, :], dim=-1
-        )
-    beta = torch.stack(beta, dim=1)
-    gamma = torch.softmax(alpha + beta, dim=-1)
-
-    return gamma
-
-
-def load_model(checkpoint=DEFAULT_CHECKPOINT, device="auto"):
-    """Load the packaged checkpoint; device='auto' selects CUDA when available."""
-    checkpoint = Path(checkpoint)
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+def load_model(device, checkpoint=DEFAULT_CHECKPOINT):
+    """Load the packaged checkpoint onto an explicitly selected device."""
     device = torch.device(device)
-    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    config = json.loads(DEFAULT_CONFIG.read_text())
+
+    # Load weights on CPU, then move the reconstructed model to the requested device.
+    checkpoint_state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    config_values = json.loads(DEFAULT_CONFIG.read_text())
+
+    input_mean = checkpoint_state["encoder_input_mean"]
+    input_sd = checkpoint_state["encoder_input_sd"]
+    floor_height = config_values["floor_m"]
+    hidden_size = config_values["model"]["hidden"]
+    initial_observations = config_values["initial_observation_parameters"]
+
     model = StructuredFootVAE(
-        state["encoder_input_mean"], state["encoder_input_sd"],
-        floor_height=config["floor_m"], hidden=config["model"]["hidden"],
+        input_mean,
+        input_sd,
+        floor_height=floor_height,
+        init_air_mean=initial_observations["air_mean_m"],
+        init_pitch_mean=initial_observations["pitch_mean_rad"],
+        hidden=hidden_size,
     )
-    model.load_state_dict(state, strict=True)
-    model.to(device).eval()
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
+    model.load_state_dict(checkpoint_state, strict=True)
+    model.to(device)
+    model.requires_grad_(False)
+
     return model
 
 
@@ -127,36 +81,72 @@ def load_model(checkpoint=DEFAULT_CHECKPOINT, device="auto"):
 def predict_contacts(joints, model, geometry_samples=32, seed=95095):
     """Infer seven-state contact probabilities for a [T,22,3] sequence.
 
-    The input motion is never modified. Context is zero, as in the trained
-    HumanML3D experiment. Output arrays use side order [left, right].
+    The input motion is never modified. Output side order is [left, right].
     """
-    joints = np.asarray(joints, dtype=np.float32)
-    if joints.ndim != 3 or joints.shape[1:] != (22, 3) or joints.shape[0] < 2:
-        raise ValueError(f"Expected joints with shape [T,22,3] and T >= 2, got {joints.shape}")
-    if not np.isfinite(joints).all():
-        raise ValueError("Input joints contain NaN or infinite values")
-    if geometry_samples < 1:
-        raise ValueError("geometry_samples must be positive")
-
     device = next(model.parameters()).device
-    batch = make_batch(joints, device)
-    q_mean, q_chol, _, _ = geometry_posterior(model, batch)
-    generator = torch.Generator(device=device).manual_seed(int(seed))
-    eps = torch.randn((geometry_samples, 2, GEOMETRY_DIM), generator=generator,
-                      device=device, dtype=batch["ankle"].dtype)
-    geometry = q_mean[None] + torch.einsum("bij,sbj->sbi", q_chol, eps)
+    foot_batch = make_batch(joints, device)
 
-    repeated = {
-        key: _repeat(batch[key], geometry_samples)
-        for key in ("ankle", "toe", "lengths", "sides")
-    }
-    gamma_samples = _forward_backward(model, repeated, geometry.reshape(-1, GEOMETRY_DIM))
-    frames = len(joints)
-    gamma_samples = gamma_samples.reshape(geometry_samples, 2, frames, 7)
-    gamma = gamma_samples.mean(0)
+    geometry_parameters = model.encode(
+        foot_batch["ankle"], foot_batch["toe"], foot_batch["lengths"]
+    )
+    foot_count = foot_batch["ankle"].shape[0]
+
+    # Fixed noise makes geometry sampling repeatable for a given seed.
+    sample_generator = torch.Generator(device=device)
+    sample_generator.manual_seed(int(seed))
+    geometry_noise = torch.randn(
+        (geometry_samples, foot_count, GEOMETRY_DIM),
+        generator=sample_generator,
+        device=device,
+        dtype=foot_batch["ankle"].dtype,
+    )
+
+    sides = foot_batch["sides"]
+    geometry_prior_mean = model.geometry_mean[sides]
+    geometry_prior_covariance = model.geometry_cov[sides]
+    repeated_geometry_parameters = geometry_parameters.repeat(geometry_samples, 1)
+    repeated_prior_mean = geometry_prior_mean.repeat(geometry_samples, 1)
+    repeated_prior_covariance = geometry_prior_covariance.repeat(geometry_samples, 1, 1)
+    flattened_geometry_noise = geometry_noise.reshape(-1, GEOMETRY_DIM)
+
+    # Reuse the model's posterior sampler so inference matches its training math.
+    sampled_geometry, _ = model.geometry_posterior.sample_and_kl(
+        repeated_geometry_parameters,
+        repeated_prior_mean,
+        repeated_prior_covariance,
+        sample=True,
+        eps=flattened_geometry_noise,
+    )
+
+    ankles_by_sample = _repeat_for_samples(foot_batch["ankle"], geometry_samples)
+    toes_by_sample = _repeat_for_samples(foot_batch["toe"], geometry_samples)
+    lengths_by_sample = _repeat_for_samples(foot_batch["lengths"], geometry_samples)
+    frames = foot_batch["ankle"].shape[1]
+
+    initial_state_scores, transition_state_scores = model.state_prior_log_potentials(
+        lengths_by_sample, frames
+    )
+    frame_emission_scores, transition_emission_scores = model.foot_contact_emission(
+        ankles_by_sample,
+        toes_by_sample,
+        sampled_geometry.reshape(-1, GEOMETRY_DIM),
+        lengths_by_sample,
+    )
+    transition_scores = transition_state_scores + transition_emission_scores
+    sampled_state_probabilities = chain_marginals(
+        initial_state_scores,
+        frame_emission_scores,
+        transition_scores,
+        lengths_by_sample,
+    )
+    sampled_state_probabilities = sampled_state_probabilities.reshape(
+        geometry_samples, foot_count, frames, len(STATE_NAMES)
+    )
+    # Marginalize foot geometry by averaging state probabilities across samples.
+    state_probabilities = sampled_state_probabilities.mean(0)
 
     return {
-        "state_probability": gamma.cpu().numpy(),
+        "state_probability": state_probabilities.cpu().numpy(),
         "state_names": np.asarray(STATE_NAMES),
-        "side_names": np.asarray(("left", "right")),
+        "side_names": np.asarray(SIDE_NAMES),
     }

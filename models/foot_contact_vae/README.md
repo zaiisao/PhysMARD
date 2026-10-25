@@ -15,7 +15,7 @@ python -m models.foot_contact_vae.predict \
   --device cuda:2
 ```
 
-The `.npz` contains one prediction array, `state_probability[side, frame, state]`, plus the state and side names. The seven-state probabilities include air, contact, sticking, and sliding information; derive those group probabilities or the most likely state from this array as needed. The JSON sidecar records the input, checkpoint, settings, and array shape. Detailed geometry and support-point diagnostics remain in the analysis outputs.
+The `.npz` contains `state_probability[side, frame, state]` and the state and side names. Detailed geometry and support-point diagnostics remain in the analysis outputs.
 
 Python entry point:
 

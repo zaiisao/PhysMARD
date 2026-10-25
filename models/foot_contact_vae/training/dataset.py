@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-FOOT = {"left": (7, 10, 0), "right": (8, 11, 1)}
+from ..source.geometry import FOOT_JOINTS
 
 
 def clip_ids(data_root, split: str, count: int, seed: int, exclude=()):
@@ -31,7 +31,7 @@ def sequence_rows(ids, data_root):
     rows = []
     for clip in ids:
         joints = np.load(data_root / "new_joints" / f"{clip}.npy").astype(np.float32)
-        for side, (ankle, toe, side_id) in FOOT.items():
+        for side_id, (side, (ankle, toe)) in enumerate(FOOT_JOINTS.items()):
             rows.append({"clip": clip, "side": side, "side_id": side_id,
                          "ankle": joints[:, ankle], "toe": joints[:, toe]})
     return rows

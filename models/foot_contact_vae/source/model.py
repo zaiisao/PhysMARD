@@ -135,6 +135,29 @@ def chain_log_partition(init, frame, edge, lengths):
     return torch.logsumexp(final_alpha, dim=-1)
 
 
+def chain_marginals(init, frame, edge, lengths):
+    """Return exact per-frame state probabilities for a batch of HMM chains."""
+    frames = frame.shape[1]
+    alpha = init + frame[:, 0]
+    forward = [alpha]
+    for t in range(1, frames):
+        next_alpha = torch.logsumexp(alpha[:, :, None] + edge[:, t - 1], dim=1) + frame[:, t]
+        alpha = torch.where((lengths > t)[:, None], next_alpha, alpha)
+        forward.append(alpha)
+
+    beta = torch.zeros_like(forward[-1])
+    backward = [beta]
+    for t in range(frames - 2, -1, -1):
+        previous_beta = torch.logsumexp(
+            edge[:, t] + frame[:, t + 1, None, :] + beta[:, None, :], dim=-1
+        )
+        beta = torch.where((lengths > t + 1)[:, None], previous_beta, torch.zeros_like(beta))
+        backward.append(beta)
+
+    backward.reverse()
+    return torch.softmax(torch.stack(forward, dim=1) + torch.stack(backward, dim=1), dim=-1)
+
+
 # Scores support height and pitch per frame, and support-point speed between frames.
 class FootContactEmission(nn.Module):
     """Gaussian observation factors for support height, pitch, and horizontal motion."""
@@ -250,7 +273,7 @@ class GeometryPosterior(nn.Module):
 
         return self.cont_head(pooled)
 
-    def sample_and_kl(self, raw, prior_mean, prior_covariance, sample):
+    def sample_and_kl(self, raw, prior_mean, prior_covariance, sample, eps=None):
         eta_mean, tri_raw = raw[:, :GEOMETRY_DIM], raw[:, GEOMETRY_DIM:]
         tri_idx = torch.tril_indices(GEOMETRY_DIM, GEOMETRY_DIM, device=raw.device)
         diagonal = tri_idx[0] == tri_idx[1]
@@ -263,7 +286,10 @@ class GeometryPosterior(nn.Module):
         posterior_chol = prior_chol @ eta_chol
 
         posterior = MultivariateNormal(posterior_mean, scale_tril=posterior_chol)
-        geom = posterior.rsample() if sample else posterior_mean
+        if sample and eps is not None:
+            geom = posterior_mean + torch.einsum("bij,bj->bi", posterior_chol, eps)
+        else:
+            geom = posterior.rsample() if sample else posterior_mean
 
         standard_posterior = MultivariateNormal(eta_mean, scale_tril=eta_chol)
         standard_prior = MultivariateNormal(
@@ -278,8 +304,8 @@ class GeometryPosterior(nn.Module):
 class StructuredFootVAE(nn.Module):
     """HumanML3D structured foot-contact VAE with normalized geometry encoder inputs."""
 
-    def __init__(self, input_mean, input_sd, floor_height=-0.0109, hidden=64,
-                 init_air_mean=0.10, init_pitch_mean=-0.3):
+    def __init__(self, input_mean, input_sd, floor_height, init_air_mean,
+                 init_pitch_mean, hidden):
         super().__init__()
 
         if len(input_mean) != NUM_ENCODER_FEATURES or len(input_sd) != NUM_ENCODER_FEATURES:

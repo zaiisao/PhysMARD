@@ -16,8 +16,12 @@ import numpy as np
 import torch
 from torch import nn
 
-from models.foot_contact_vae.inference import elbo_mc
-from models.foot_contact_vae.source.model import GEOMETRY_DIM, NUM_ENCODER_FEATURES, StructuredFootVAE
+from models.foot_contact_vae.source.model import (
+    GEOMETRY_DIM,
+    NUM_ENCODER_FEATURES,
+    StructuredFootVAE,
+    chain_log_partition,
+)
 from .dataset import batches, clip_ids, collate, input_statistics, sequence_rows
 
 TRAINING_DIR = Path(__file__).resolve().parent
@@ -28,30 +32,55 @@ RUN_DIR = None
 CHECKPOINT_DIR = None
 LOG_DIR = None
 
-SCALE_INITIALS = {
-    "raw_contact_sd": 0.01,
-    "raw_air_sd": 0.08,
-    "raw_flat_pitch_sd": 0.05,
-    "raw_pitch_sd": 0.50,
-    "raw_stick_speed_sd": 0.03,
-    "raw_slide_speed_sd": 0.50,
-    "raw_free_speed_sd": 1.0,
+SCALE_PARAMETER_CONFIG_KEYS = {
+    "raw_contact_sd": "contact_sd_m",
+    "raw_air_sd": "air_sd_m",
+    "raw_flat_pitch_sd": "flat_pitch_sd_rad",
+    "raw_pitch_sd": "pitch_sd_rad",
+    "raw_stick_speed_sd": "stick_speed_sd_mps",
+    "raw_slide_speed_sd": "slide_speed_sd_mps",
+    "raw_free_speed_sd": "free_speed_sd_mps",
 }
 
 
 class ELBOBatchModule(nn.Module):
-    def __init__(self, model, geometry_samples):
+    def __init__(self, model):
         super().__init__()
         self.model = model
-        self.geometry_samples = geometry_samples
 
     def forward(self, ankle, toe, lengths, sides, eps_by_sequence):
         batch = {"ankle": ankle, "toe": toe, "lengths": lengths, "sides": sides}
-        elbo, _ = elbo_mc(
-            self.model, batch, self.geometry_samples,
-            eps=eps_by_sequence.transpose(0, 1).contiguous(),
+        return monte_carlo_elbo(
+            self.model, batch, eps_by_sequence.transpose(0, 1).contiguous()
         )
-        return elbo
+
+
+def monte_carlo_elbo(model, batch, eps):
+    """Estimate the ELBO over geometry samples, with an analytic geometry KL."""
+    samples = eps.shape[0]
+    batch_size = batch["lengths"].shape[0]
+    sides = batch["sides"]
+    raw = model.encode(batch["ankle"], batch["toe"], batch["lengths"])
+    geometry, kl = model.geometry_posterior.sample_and_kl(
+        raw.repeat(samples, 1),
+        model.geometry_mean[sides].repeat(samples, 1),
+        model.geometry_cov[sides].repeat(samples, 1, 1),
+        sample=True,
+        eps=eps.reshape(-1, GEOMETRY_DIM),
+    )
+
+    ankle = batch["ankle"].repeat(samples, 1, 1)
+    toe = batch["toe"].repeat(samples, 1, 1)
+    lengths = batch["lengths"].repeat(samples)
+    sides = batch["sides"].repeat(samples)
+    p_init, p_edge = model.state_prior_log_potentials(lengths, ankle.shape[1])
+    frame, emission_edge = model.foot_contact_emission(
+        ankle, toe, geometry.reshape(-1, GEOMETRY_DIM), lengths
+    )
+    log_z = chain_log_partition(p_init, frame, p_edge + emission_edge, lengths)
+    mean_log_z = log_z.reshape(samples, batch_size).mean(0)
+    mean_kl = kl.reshape(samples, batch_size).mean(0)
+    return mean_log_z - mean_kl
 
 
 def inverse_softplus(value):
@@ -59,11 +88,12 @@ def inverse_softplus(value):
 
 
 def initialize_observation_parameters(model):
+    initial_values = CONFIG["initial_observation_parameters"]
     with torch.no_grad():
-        for name, value in SCALE_INITIALS.items():
-            getattr(model.foot_contact_emission, name).fill_(inverse_softplus(value))
-        model.foot_contact_emission.air_mean.fill_(0.10)
-        model.foot_contact_emission.pitch_mean.fill_(-0.30)
+        for parameter_name, config_key in SCALE_PARAMETER_CONFIG_KEYS.items():
+            scale = initial_values[config_key]
+            parameter = getattr(model.foot_contact_emission, parameter_name)
+            parameter.fill_(inverse_softplus(scale))
 
 
 def set_trainable_stage(model, stage):
@@ -179,12 +209,26 @@ def main(argv=None):
     train_rows = sequence_rows(train_ids, args.dataset_root)
     validation_rows = sequence_rows(validation_ids, args.dataset_root)
 
-    probe = StructuredFootVAE(torch.zeros(NUM_ENCODER_FEATURES), torch.ones(NUM_ENCODER_FEATURES), floor_height=CONFIG["floor_m"])
+    initial_values = CONFIG["initial_observation_parameters"]
+    probe = StructuredFootVAE(
+        torch.zeros(NUM_ENCODER_FEATURES),
+        torch.ones(NUM_ENCODER_FEATURES),
+        floor_height=CONFIG["floor_m"],
+        init_air_mean=initial_values["air_mean_m"],
+        init_pitch_mean=initial_values["pitch_mean_rad"],
+        hidden=CONFIG["model"]["hidden"],
+    )
     input_mean, input_sd = input_statistics(train_rows, probe, CONFIG["training"]["input_statistics_rows"])
-    model = StructuredFootVAE(input_mean, input_sd, floor_height=CONFIG["floor_m"],
-                             hidden=CONFIG["model"]["hidden"]).to(device)
+    model = StructuredFootVAE(
+        input_mean,
+        input_sd,
+        floor_height=CONFIG["floor_m"],
+        init_air_mean=initial_values["air_mean_m"],
+        init_pitch_mean=initial_values["pitch_mean_rad"],
+        hidden=CONFIG["model"]["hidden"],
+    ).to(device)
     initialize_observation_parameters(model)
-    objective = ELBOBatchModule(model, CONFIG["training"]["geometry_samples"]).to(device)
+    objective = ELBOBatchModule(model).to(device)
 
     validation_rng = torch.Generator(device=device).manual_seed(180731)
     validation_batches = []
@@ -208,7 +252,7 @@ def main(argv=None):
     with torch.no_grad():
         production = model(probe_batch["ankle"], probe_batch["toe"], probe_batch["lengths"],
                            probe_batch["sides"], sample=False)
-        adapted, _ = elbo_mc(model, probe_batch, 1, eps=zero_eps)
+        adapted = monte_carlo_elbo(model, probe_batch, zero_eps)
         api_error = float((production - adapted).abs().max())
     if not np.isfinite(api_error) or api_error > 1e-4:
         raise RuntimeError(f"Model and Monte Carlo ELBO paths disagree: max error {api_error}")
