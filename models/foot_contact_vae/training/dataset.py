@@ -7,26 +7,40 @@ import numpy as np
 import torch
 
 from ..source.geometry import FOOT_JOINTS
+from ..source.model import FPS, foot_frame
+
+JOINT_COUNT = 22
+COORDINATE_COUNT = 3
 
 
-def clip_ids(data_root, split: str, count: int, seed: int, exclude=()):
+def select_train_validation_clips(data_root, train_count, validation_count, seed):
     data_root = Path(data_root)
-    excluded = set(exclude)
-    ids = [line.strip() for line in (data_root / f"{split}.txt").read_text().splitlines()
-           if line.strip() and line.strip() not in excluded and not line.strip().startswith("M")]
-    rng = np.random.default_rng(seed)
-    rng.shuffle(ids)
-    selected = []
-    for clip in ids:
+    train_file = data_root / "train.txt"
+    lines = train_file.read_text().splitlines()
+    names = [line.strip() for line in lines if line.strip()]
+
+    np.random.default_rng(seed).shuffle(names)
+
+    train_names, validation_names = [], []
+    for clip in names:
         joints = np.load(data_root / "new_joints" / f"{clip}.npy", mmap_mode="r")
-        if joints.ndim == 3 and joints.shape[1:] == (22, 3) and 40 <= len(joints) <= 200:
-            selected.append(clip)
-        if len(selected) == count:
-            return selected
-    raise RuntimeError(f"Only selected {len(selected)} of {count} {split} clips")
+        if joints.ndim != 3 or joints.shape[1:] != (JOINT_COUNT, COORDINATE_COUNT):
+            continue
+
+        if len(train_names) < train_count:
+            train_names.append(clip)
+        elif len(validation_names) < validation_count:
+            validation_names.append(clip)
+        if len(train_names) == train_count and len(validation_names) == validation_count:
+            break
+
+    if len(train_names) != train_count or len(validation_names) != validation_count:
+        raise RuntimeError("Not enough valid clips for the requested split sizes")
+
+    return train_names, validation_names
 
 
-def sequence_rows(ids, data_root):
+def load_foot_sequences(ids, data_root):
     data_root = Path(data_root)
     rows = []
     for clip in ids:
@@ -57,20 +71,27 @@ def collate(rows, device="cpu"):
     }
 
 
-def batches(rows, size, shuffle, rng):
-    ordered = sorted(range(len(rows)), key=lambda index: len(rows[index]["ankle"]))
-    chunks = [ordered[start:start + size] for start in range(0, len(ordered), size)]
-    if shuffle:
-        rng.shuffle(chunks)
-    return [[rows[index] for index in chunk] for chunk in chunks]
+def encoder_input_statistics(rows):
+    """Return mean and standard deviation for the encoder input features."""
+    batch = collate(rows)
+    ankle, toe = batch["ankle"], batch["toe"]
+    _, _, _, ankle_to_toe_angle = foot_frame(ankle, toe)
 
+    ankle_velocity = FPS * torch.linalg.vector_norm(
+        ankle[:, 1:] - ankle[:, :-1], dim=-1, keepdim=True
+    )
+    toe_velocity = FPS * torch.linalg.vector_norm(
+        toe[:, 1:] - toe[:, :-1], dim=-1, keepdim=True
+    )
 
-def input_statistics(rows, model, count=400):
-    batch = collate(rows[:count])
-    features = torch.cat(model.encoder_inputs(batch["ankle"], batch["toe"]), dim=-1)
+    ankle_speed = torch.cat((ankle_velocity, ankle_velocity[:, -1:]), dim=1)
+    toe_speed = torch.cat((toe_velocity, toe_velocity[:, -1:]), dim=1)
+
+    features = torch.cat((
+        ankle[..., 1:2], toe[..., 1:2], ankle_to_toe_angle, ankle_speed, toe_speed
+    ), dim=-1)
     valid = torch.arange(features.shape[1])[None] < batch["lengths"][:, None]
     values = features[valid]
     mean, sd = values.mean(0), values.std(0)
-    if not torch.isfinite(mean).all() or not torch.isfinite(sd).all() or not (sd > 0).all():
-        raise RuntimeError("Invalid encoder input statistics")
+
     return mean, sd

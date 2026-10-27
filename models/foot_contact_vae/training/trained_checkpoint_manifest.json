@@ -3,7 +3,7 @@
   "checkpoint_source": "/disk4/jaehoon/MARDM/analysis/joint_contact_physics/checkpoints/best.pt",
   "checkpoint_sha256": "0a6b22e659561d07f07b567411ed4d7c8f5b5838a79bec23df3928c7e4ced16f",
   "best_validation_elbo": 953.0832824707031,
-  "training_config": "models/foot_contact_vae/training/config.json",
+  "training_config": "models/foot_contact_vae/training/config.yaml",
   "dataset_root": "/disk4/jaehoon/HumanML3D",
   "train_clips": [
     "006423",

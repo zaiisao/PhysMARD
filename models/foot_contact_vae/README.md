@@ -4,7 +4,7 @@ This package predicts foot-contact states from a HumanML3D joint sequence. It do
 
 ## Input → output
 
-Input is a NumPy array with shape `[T, 22, 3]`, in HumanML3D joint order and world coordinates in meters, sampled at 20 fps. The floor is fixed at `y = -0.0109 m`. The VAE runs both feet independently.
+Input is a NumPy array with shape `[T, 22, 3]`, in HumanML3D joint order and world coordinates in meters, sampled at 20 fps. The model treats `y = 0` as the floor and runs both feet independently.
 
 Run from the repository root:
 
@@ -31,6 +31,9 @@ print(prediction["state_probability"].shape)  # [2, T, 7]
 
 ## Model and checkpoint
 
+- `geometry_diagram.png` shows the SMPL support-point prior and how the encoder samples geometry from it; `geometry_diagram.svg` is the vector version.
+- `vector_projection_diagram.png` shows the same neutral SMPL foot mesh from six views, with world-up and its ankle-to-toe-perpendicular direction overlaid.
+- `geometry_prior_on_mesh.png` overlays geometry-prior samples and uncertainty ellipses on the neutral SMPL foot mesh.
 - `source/model.py` contains the seven-state model and HumanML3D input normalization. It uses five foot features and an unconditioned state prior; the existing checkpoint was converted once to remove its zero context channels.
 - `source/geometry.py` and `source/support_geometry.json` provide the fixed left/right heel, pad, and tip geometry prior. Model loading reads the cached JSON and does not require the SMPL asset.
 - `inference.py` loads the selected checkpoint and produces the seven-state probability output.
@@ -40,7 +43,7 @@ The checkpoint file is local and is not included in Git. The older, incompatible
 
 ## Training
 
-The canonical training entry point is `training/train.py`; its HumanML3D loader is `training/dataset.py`, and its settings are in `training/config.json`. It uses the train split for fitting and validation, keeps the test split separate, and saves each run under `models/foot_contact_vae/runs/` without overwriting the packaged checkpoint.
+The canonical training entry point is `training/train.py`; its HumanML3D loader is `training/dataset.py`, and its settings are in `training/config.yaml`. It selects disjoint training and validation clips from the train split and saves each run under `models/foot_contact_vae/runs/` without overwriting the packaged checkpoint.
 
 ```bash
 python -m models.foot_contact_vae.training.train \
@@ -48,7 +51,7 @@ python -m models.foot_contact_vae.training.train \
   --device cuda:2
 ```
 
-Use `--run-dir` to choose an explicit output directory. The run contains stage checkpoints, logs, a preflight record, and the exact split/input-statistics manifest.
+Use `--run-dir` to choose an explicit output directory. The run contains one best checkpoint per training stage, epoch logs, and a manifest with the selected clips and encoder normalization statistics.
 
 ## Experiment boundary
 

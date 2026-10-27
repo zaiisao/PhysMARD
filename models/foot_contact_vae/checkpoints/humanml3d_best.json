@@ -4,7 +4,6 @@
   "checkpoint_sha256": "0a6b22e659561d07f07b567411ed4d7c8f5b5838a79bec23df3928c7e4ced16f",
   "source_commit": "b87b2bdf6af961ac8eec5ed476af36d4842dc161",
   "best_validation_elbo": 953.0832824707031,
-  "floor_height_m": -0.0109,
   "fps": 20,
   "hidden": 64,
   "input_shape": "[T,22,3] world-space HumanML3D joints in meters",

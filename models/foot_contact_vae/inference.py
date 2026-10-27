@@ -1,17 +1,17 @@
 """Load the trained HumanML3D VAE and infer foot-contact probabilities from joints."""
 
-import json
 from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
 from .source.geometry import FOOT_JOINTS, SIDE_NAMES
 from .source.model import GEOMETRY_DIM, STATE_ORDER, StructuredFootVAE, chain_marginals
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 DEFAULT_CHECKPOINT = PACKAGE_ROOT / "checkpoints" / "humanml3d_best.pt"
-DEFAULT_CONFIG = PACKAGE_ROOT / "training" / "config.json"
+DEFAULT_CONFIG = PACKAGE_ROOT / "training" / "config.yaml"
 STATE_NAMES = tuple(state.name.lower() for state in STATE_ORDER)
 
 
@@ -54,20 +54,14 @@ def load_model(device, checkpoint=DEFAULT_CHECKPOINT):
 
     # Load weights on CPU, then move the reconstructed model to the requested device.
     checkpoint_state = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    config_values = json.loads(DEFAULT_CONFIG.read_text())
+    config_values = yaml.safe_load(DEFAULT_CONFIG.read_text())
 
     input_mean = checkpoint_state["encoder_input_mean"]
     input_sd = checkpoint_state["encoder_input_sd"]
-    floor_height = config_values["floor_m"]
     hidden_size = config_values["model"]["hidden"]
-    initial_observations = config_values["initial_observation_parameters"]
-
     model = StructuredFootVAE(
         input_mean,
         input_sd,
-        floor_height=floor_height,
-        init_air_mean=initial_observations["air_mean_m"],
-        init_pitch_mean=initial_observations["pitch_mean_rad"],
         hidden=hidden_size,
     )
     model.load_state_dict(checkpoint_state, strict=True)
@@ -104,18 +98,13 @@ def predict_contacts(joints, model, geometry_samples=32, seed=95095):
     sides = foot_batch["sides"]
     geometry_prior_mean = model.geometry_mean[sides]
     geometry_prior_covariance = model.geometry_cov[sides]
-    repeated_geometry_parameters = geometry_parameters.repeat(geometry_samples, 1)
-    repeated_prior_mean = geometry_prior_mean.repeat(geometry_samples, 1)
-    repeated_prior_covariance = geometry_prior_covariance.repeat(geometry_samples, 1, 1)
-    flattened_geometry_noise = geometry_noise.reshape(-1, GEOMETRY_DIM)
 
     # Reuse the model's posterior sampler so inference matches its training math.
     sampled_geometry, _ = model.geometry_posterior.sample_and_kl(
-        repeated_geometry_parameters,
-        repeated_prior_mean,
-        repeated_prior_covariance,
-        sample=True,
-        eps=flattened_geometry_noise,
+        geometry_parameters,
+        geometry_prior_mean,
+        geometry_prior_covariance,
+        geometry_noise,
     )
 
     ankles_by_sample = _repeat_for_samples(foot_batch["ankle"], geometry_samples)

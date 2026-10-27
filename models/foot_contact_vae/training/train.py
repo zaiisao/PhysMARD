@@ -8,272 +8,163 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch import nn
+import yaml
 
-from models.foot_contact_vae.source.model import (
-    GEOMETRY_DIM,
-    NUM_ENCODER_FEATURES,
-    StructuredFootVAE,
-    chain_log_partition,
+from models.foot_contact_vae.source.model import GEOMETRY_DIM, StructuredFootVAE
+from .dataset import (
+    collate,
+    encoder_input_statistics,
+    load_foot_sequences,
+    select_train_validation_clips,
 )
-from .dataset import batches, clip_ids, collate, input_statistics, sequence_rows
 
 TRAINING_DIR = Path(__file__).resolve().parent
 PACKAGE_DIR = TRAINING_DIR.parent
-DEFAULT_CONFIG = TRAINING_DIR / "config.json"
-CONFIG = json.loads(DEFAULT_CONFIG.read_text())
-RUN_DIR = None
-CHECKPOINT_DIR = None
-LOG_DIR = None
-
-SCALE_PARAMETER_CONFIG_KEYS = {
-    "raw_contact_sd": "contact_sd_m",
-    "raw_air_sd": "air_sd_m",
-    "raw_flat_pitch_sd": "flat_pitch_sd_rad",
-    "raw_pitch_sd": "pitch_sd_rad",
-    "raw_stick_speed_sd": "stick_speed_sd_mps",
-    "raw_slide_speed_sd": "slide_speed_sd_mps",
-    "raw_free_speed_sd": "free_speed_sd_mps",
-}
+DEFAULT_CONFIG = TRAINING_DIR / "config.yaml"
 
 
-class ELBOBatchModule(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, ankle, toe, lengths, sides, eps_by_sequence):
-        batch = {"ankle": ankle, "toe": toe, "lengths": lengths, "sides": sides}
-        return monte_carlo_elbo(
-            self.model, batch, eps_by_sequence.transpose(0, 1).contiguous()
-        )
+def load_config():
+    return yaml.safe_load(DEFAULT_CONFIG.read_text())
 
 
-def monte_carlo_elbo(model, batch, eps):
-    """Estimate the ELBO over geometry samples, with an analytic geometry KL."""
-    samples = eps.shape[0]
-    batch_size = batch["lengths"].shape[0]
-    sides = batch["sides"]
-    raw = model.encode(batch["ankle"], batch["toe"], batch["lengths"])
-    geometry, kl = model.geometry_posterior.sample_and_kl(
-        raw.repeat(samples, 1),
-        model.geometry_mean[sides].repeat(samples, 1),
-        model.geometry_cov[sides].repeat(samples, 1, 1),
-        sample=True,
-        eps=eps.reshape(-1, GEOMETRY_DIM),
-    )
+def write_training_manifest(run_dir, dataset_root, train_ids, validation_ids, train_rows, validation_rows,
+                            input_mean, input_sd, config):
+    manifest_path = run_dir / "training_manifest.json"
 
-    ankle = batch["ankle"].repeat(samples, 1, 1)
-    toe = batch["toe"].repeat(samples, 1, 1)
-    lengths = batch["lengths"].repeat(samples)
-    sides = batch["sides"].repeat(samples)
-    p_init, p_edge = model.state_prior_log_potentials(lengths, ankle.shape[1])
-    frame, emission_edge = model.foot_contact_emission(
-        ankle, toe, geometry.reshape(-1, GEOMETRY_DIM), lengths
-    )
-    log_z = chain_log_partition(p_init, frame, p_edge + emission_edge, lengths)
-    mean_log_z = log_z.reshape(samples, batch_size).mean(0)
-    mean_kl = kl.reshape(samples, batch_size).mean(0)
-    return mean_log_z - mean_kl
+    manifest = {
+        "dataset_root": str(Path(dataset_root).resolve()),
+        "train_clips": train_ids,
+        "validation_clips": validation_ids,
+        "train_sequences": len(train_rows),
+        "validation_sequences": len(validation_rows),
+        "input_mean": input_mean.tolist(),
+        "input_sd": input_sd.tolist(),
+        "config": config,
+    }
+    manifest_json = json.dumps(manifest, indent=2) + "\n"
+    manifest_path.write_text(manifest_json)
 
 
-def inverse_softplus(value):
-    return float(np.log(np.expm1(value)))
+def train_model(model, config, device, train_sequences, validation_batches, checkpoint_dir, log_dir):
+    training = config["training"]
+    seed = config["seed"]
+    geometry_samples = training["geometry_samples"]
+    optimizer = torch.optim.Adam(model.parameters(), lr=training["learning_rate"])
 
-
-def initialize_observation_parameters(model):
-    initial_values = CONFIG["initial_observation_parameters"]
-    with torch.no_grad():
-        for parameter_name, config_key in SCALE_PARAMETER_CONFIG_KEYS.items():
-            scale = initial_values[config_key]
-            parameter = getattr(model.foot_contact_emission, parameter_name)
-            parameter.fill_(inverse_softplus(scale))
-
-
-def set_trainable_stage(model, stage):
-    if stage not in {"fixed_scales", "scale_finetune"}:
-        raise ValueError(stage)
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
-    for name, parameter in model.named_parameters():
-        if name in {"prior_init_logits", "prior_transition_logits"} or name.startswith("geometry_posterior."):
-            parameter.requires_grad_(True)
-        if stage == "scale_finetune" and name in {
-            "foot_contact_emission.air_mean", "foot_contact_emission.pitch_mean", "foot_contact_emission.raw_contact_sd",
-            "foot_contact_emission.raw_air_sd", "foot_contact_emission.raw_flat_pitch_sd", "foot_contact_emission.raw_pitch_sd",
-            "foot_contact_emission.raw_stick_speed_sd", "foot_contact_emission.raw_free_speed_sd",
-        }:
-            parameter.requires_grad_(True)
-
-
-def state_to_cpu(model):
-    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-
-
-def log_scales(model):
-    values = {key: float(torch.nn.functional.softplus(getattr(model.foot_contact_emission, name)).detach())
-              for key, name in {
-                  "contact_sd_m": "raw_contact_sd", "air_sd_m": "raw_air_sd",
-                  "flat_pitch_sd_rad": "raw_flat_pitch_sd", "pitch_sd_rad": "raw_pitch_sd",
-                  "stick_speed_sd_mps": "raw_stick_speed_sd", "slide_speed_sd_mps": "raw_slide_speed_sd",
-                  "free_speed_sd_mps": "raw_free_speed_sd",
-              }.items()}
-    values["air_mean_m"] = float(model.foot_contact_emission.air_mean.detach())
-    values["pitch_mean_rad"] = float(model.foot_contact_emission.pitch_mean.detach())
-    return values
-
-
-def train_stage(model, objective, device, train_rows, validation_batches, stage, epochs, seed):
-    set_trainable_stage(model, stage)
-    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.Adam(trainable, lr=CONFIG["training"]["learning_rate"])
-    rng = np.random.default_rng(seed)
-    samples = CONFIG["training"]["geometry_samples"]
-    best_value, best_state = -float("inf"), None
-    history, start = [], time.time()
-    log_path = LOG_DIR / f"{stage}.jsonl"
+    best_validation_elbo = -float("inf")
+    log_path = log_dir / "training.jsonl"
     with log_path.open("w") as handle:
-        for epoch in range(1, epochs + 1):
-            model.train()
-            losses = []
-            for rows in batches(train_rows, CONFIG["training"]["batch_sequences"], True, rng):
+        for epoch in range(training["epochs"]):
+            shuffled_sequences = train_sequences.copy()
+            np.random.shuffle(shuffled_sequences)
+
+            total_training_loss = 0.0
+            training_batch_count = 0
+            batch_size = training["batch_sequences"]
+
+            for start in range(0, len(shuffled_sequences), batch_size):
+                rows = shuffled_sequences[start:start + batch_size]
+
                 batch = collate(rows, device=device)
-                eps = torch.randn(len(rows), samples, GEOMETRY_DIM, device=device)
-                loss = -objective(batch["ankle"], batch["toe"], batch["lengths"],
-                                  batch["sides"], eps).mean()
-                if not torch.isfinite(loss):
-                    raise FloatingPointError(f"Nonfinite loss at {stage}, epoch {epoch}")
+                loss = -model(
+                    batch["ankle"], batch["toe"], batch["lengths"], batch["sides"],
+                    samples=geometry_samples,
+                ).mean()
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(trainable, CONFIG["training"]["gradient_clip_norm"])
                 optimizer.step()
-                losses.append(float(loss.detach()))
 
-            model.eval()
+                total_training_loss += float(loss.detach())
+                training_batch_count += 1
+
+            validation_generator = torch.Generator(device=device).manual_seed(seed)
+            validation_elbos = []
             with torch.no_grad():
-                validation = [float(objective(batch["ankle"], batch["toe"], batch["lengths"],
-                                              batch["sides"], eps).mean())
-                              for batch, eps in validation_batches]
-            row = {"stage": stage, "epoch": epoch, "train_elbo_mean": -float(np.mean(losses)),
-                   "validation_elbo_mean": float(np.mean(validation)),
-                   "seconds_elapsed": time.time() - start, "scales": log_scales(model)}
-            history.append(row)
-            handle.write(json.dumps(row) + "\n")
-            handle.flush()
-            print(json.dumps(row), flush=True)
-            if row["validation_elbo_mean"] > best_value:
-                best_value = row["validation_elbo_mean"]
-                best_state = state_to_cpu(model)
-                torch.save(best_state, CHECKPOINT_DIR / f"best_{stage}.pt")
+                for batch in validation_batches:
+                    validation_elbo = model(
+                        batch["ankle"], batch["toe"], batch["lengths"], batch["sides"],
+                        samples=geometry_samples, generator=validation_generator,
+                    ).mean()
+                    validation_elbos.append(float(validation_elbo))
 
-    if best_state is None:
-        raise RuntimeError(f"No checkpoint produced for {stage}")
-    model.load_state_dict(best_state)
-    best_epoch = max(history, key=lambda item: item["validation_elbo_mean"])["epoch"]
-    (LOG_DIR / f"{stage}_summary.json").write_text(json.dumps({
-        "stage": stage, "epochs_requested": epochs, "best_epoch": best_epoch,
-        "best_validation_elbo": best_value, "elapsed_seconds": time.time() - start,
-        "scales": log_scales(model),
-    }, indent=2) + "\n")
+            metrics = {
+                "epoch": epoch + 1,
+                "train_elbo_mean": -total_training_loss / training_batch_count,
+                "validation_elbo_mean": float(np.mean(validation_elbos)),
+            }
+
+            log_line = json.dumps(metrics)
+            handle.write(log_line + "\n")
+            handle.flush()
+
+            print(log_line, flush=True)
+
+            if metrics["validation_elbo_mean"] > best_validation_elbo:
+                best_validation_elbo = metrics["validation_elbo_mean"]
+                checkpoint = {
+                    name: tensor.detach().cpu().clone()
+                    for name, tensor in model.state_dict().items()
+                }
+                torch.save(checkpoint, checkpoint_dir / "best.pt")
 
 
 def main(argv=None):
+    config = load_config()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-root", default=CONFIG["dataset_root"])
-    parser.add_argument("--device", default=CONFIG["device"])
+    parser.add_argument("--dataset-root", default=config["dataset_root"])
+    parser.add_argument("--device", default=config["device"])
     parser.add_argument("--run-dir", help="Output directory; defaults to a timestamped folder under package/runs")
     args = parser.parse_args(argv)
 
-    global RUN_DIR, CHECKPOINT_DIR, LOG_DIR
-    RUN_DIR = Path(args.run_dir) if args.run_dir else PACKAGE_DIR / "runs" / f"humanml3d_{datetime.now():%Y%m%d_%H%M%S}"
-    CHECKPOINT_DIR, LOG_DIR = RUN_DIR / "checkpoints", RUN_DIR / "logs"
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=False)
-    LOG_DIR.mkdir(parents=True, exist_ok=False)
+    run_dir = Path(args.run_dir) if args.run_dir else PACKAGE_DIR / "runs" / f"humanml3d_{datetime.now():%Y%m%d_%H%M%S}"
+    checkpoint_dir, log_dir = run_dir / "checkpoints", run_dir / "logs"
+    checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    log_dir.mkdir(parents=True, exist_ok=False)
 
-    seed = CONFIG["seed"]
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.set_num_threads(4)
+    seed = config["seed"]
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is unavailable; refusing a CPU fallback")
 
-    splits, split_seeds = CONFIG["split_sizes_clips"], CONFIG["split_seeds"]
-    train_ids = clip_ids(args.dataset_root, "train", splits["train"], split_seeds["train"])
-    validation_ids = clip_ids(args.dataset_root, "train", splits["validation"], split_seeds["validation"], train_ids)
-    test_ids = clip_ids(args.dataset_root, "test", splits["test"], split_seeds["test"])
-    train_rows = sequence_rows(train_ids, args.dataset_root)
-    validation_rows = sequence_rows(validation_ids, args.dataset_root)
-
-    initial_values = CONFIG["initial_observation_parameters"]
-    probe = StructuredFootVAE(
-        torch.zeros(NUM_ENCODER_FEATURES),
-        torch.ones(NUM_ENCODER_FEATURES),
-        floor_height=CONFIG["floor_m"],
-        init_air_mean=initial_values["air_mean_m"],
-        init_pitch_mean=initial_values["pitch_mean_rad"],
-        hidden=CONFIG["model"]["hidden"],
+    train_ids, validation_ids = select_train_validation_clips(
+        args.dataset_root,
+        config["split_sizes_clips"]["train"],
+        config["split_sizes_clips"]["validation"],
+        seed,
     )
-    input_mean, input_sd = input_statistics(train_rows, probe, CONFIG["training"]["input_statistics_rows"])
+
+    train_rows = load_foot_sequences(train_ids, args.dataset_root)
+    validation_rows = load_foot_sequences(validation_ids, args.dataset_root)
+
+    input_mean, input_sd = encoder_input_statistics(train_rows)
     model = StructuredFootVAE(
-        input_mean,
-        input_sd,
-        floor_height=CONFIG["floor_m"],
-        init_air_mean=initial_values["air_mean_m"],
-        init_pitch_mean=initial_values["pitch_mean_rad"],
-        hidden=CONFIG["model"]["hidden"],
+        input_mean, input_sd,
+        hidden=config["model"]["hidden"],
     ).to(device)
-    initialize_observation_parameters(model)
-    objective = ELBOBatchModule(model).to(device)
 
-    validation_rng = torch.Generator(device=device).manual_seed(180731)
     validation_batches = []
-    for rows in batches(validation_rows, 32, False, np.random.default_rng(0)):
+    for start in range(0, len(validation_rows), 32):
+        rows = validation_rows[start:start + 32]
         batch = collate(rows, device=device)
-        eps = torch.randn(len(rows), CONFIG["training"]["validation_geometry_samples"], GEOMETRY_DIM,
-                          generator=validation_rng, device=device)
-        validation_batches.append((batch, eps))
+        validation_batches.append(batch)
 
-    manifest = {
-        "dataset_root": str(Path(args.dataset_root).resolve()),
-        "train_clips": train_ids, "validation_clips": validation_ids, "test_clips": test_ids,
-        "train_sequences": len(train_rows), "validation_sequences": len(validation_rows),
-        "test_sequences": 2 * len(test_ids), "input_mean": input_mean.tolist(), "input_sd": input_sd.tolist(),
-        "config": CONFIG,
-    }
-    (RUN_DIR / "training_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    write_training_manifest(
+        run_dir, args.dataset_root, train_ids, validation_ids,
+        train_rows, validation_rows, input_mean, input_sd, config,
+    )
 
-    zero_eps = torch.zeros(1, 2, GEOMETRY_DIM, device=device)
-    probe_batch = collate(train_rows[:2], device=device)
-    with torch.no_grad():
-        production = model(probe_batch["ankle"], probe_batch["toe"], probe_batch["lengths"],
-                           probe_batch["sides"], sample=False)
-        adapted = monte_carlo_elbo(model, probe_batch, zero_eps)
-        api_error = float((production - adapted).abs().max())
-    if not np.isfinite(api_error) or api_error > 1e-4:
-        raise RuntimeError(f"Model and Monte Carlo ELBO paths disagree: max error {api_error}")
-    (RUN_DIR / "preflight.json").write_text(json.dumps({"forward_elbo_max_abs_error": api_error}, indent=2) + "\n")
+    print(f"Training on {device}; output: {run_dir}", flush=True)
+    train_model(model, config, device, train_rows, validation_batches, checkpoint_dir, log_dir)
 
-    print(f"Training on {device}; output: {RUN_DIR}", flush=True)
-    train_stage(model, objective, device, train_rows, validation_batches, "fixed_scales",
-                CONFIG["scale_schedule"]["fixed_scales_epochs"], seed)
-    torch.save(state_to_cpu(model), CHECKPOINT_DIR / "final_fixed_scales.pt")
-    train_stage(model, objective, device, train_rows, validation_batches, "scale_finetune",
-                CONFIG["scale_schedule"]["scale_finetune_epochs"], seed + 1)
-    final_state = state_to_cpu(model)
-    torch.save(final_state, CHECKPOINT_DIR / "best.pt")
-    torch.save(final_state, CHECKPOINT_DIR / "final.pt")
-    metadata = {
-        "checkpoint": str(CHECKPOINT_DIR / "best.pt"), "run_dir": str(RUN_DIR),
-        "best_validation_elbo": json.loads((LOG_DIR / "scale_finetune_summary.json").read_text())["best_validation_elbo"],
-        "floor_m": CONFIG["floor_m"], "device": str(device),
-    }
-    (CHECKPOINT_DIR / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    print(json.dumps(metadata), flush=True)
+    print(f"Best checkpoint: {checkpoint_dir / 'best.pt'}", flush=True)
 
 
 if __name__ == "__main__":
